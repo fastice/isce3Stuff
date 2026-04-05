@@ -166,6 +166,15 @@ conda install -c conda-forge isce3-cuda
 conda search -c conda-forge isce3
 ```
 
+**Using mamba for faster solving**
+
+The conda solver can be slow for complex environments. `mamba` is a drop-in replacement that solves significantly faster:
+
+```bash
+conda install -c conda-forge mamba
+mamba install -c conda-forge isce3
+```
+
 ### 3.2 Building from Source
 
 Building from source is required if you need a development build, want to modify the C++ core, or are working on a platform not covered by the conda packages.
@@ -216,6 +225,8 @@ export PYTHONPATH=/path/to/install/packages:$PYTHONPATH
 export PATH=/path/to/install/bin:$PATH
 ```
 
+You may wish to add these lines to your shell profile (`~/.bashrc` or `~/.zshrc`).
+
 #### Building with CUDA
 
 ```bash
@@ -240,10 +251,16 @@ A basic sanity check for geometry:
 ```python
 import isce3
 
-# Create a WGS84 ellipsoid
+# Create a WGS84 ellipsoid and confirm constants
 ellipsoid = isce3.core.Ellipsoid()
-print(f"Semi-major axis: {ellipsoid.a} m")
-print(f"Eccentricity squared: {ellipsoid.e2}")
+print(f"Semi-major axis: {ellipsoid.a} m")      # 6378137.0
+print(f"Eccentricity squared: {ellipsoid.e2}")   # 0.00669437999014
+
+# Quick round-trip: ECEF → geodetic → ECEF
+xyz = [-2412125.5, -4898625.0, 4786555.5]
+lon, lat, h = ellipsoid.xyz_to_lon_lat(xyz)
+xyz2 = ellipsoid.lon_lat_to_xyz([lon, lat, h])
+print(f"Round-trip error: {max(abs(a-b) for a,b in zip(xyz, xyz2)):.6f} m")
 ```
 
 You can also run the test suite (requires a source build):
@@ -263,34 +280,51 @@ Understanding ISCE3's handling of geometry is essential for working with the lib
 
 A SAR sensor illuminates a swath of terrain from a moving platform. Each point on the ground is characterized by:
 
-- **Azimuth time** — the time at which the sensor antenna footprint passes over the target.
-- **Slant range** — the distance from the antenna to the target at the moment of imaging.
+- **Azimuth time** — the UTC time at which the sensor antenna footprint passes over the target along the flight path.
+- **Slant range** — the straight-line distance from the antenna phase centre to the target at the moment of imaging.
 
-Together, (azimuth time, slant range) define the **radar (or range-Doppler) coordinate system**.
+Together, (azimuth time, slant range) define the **radar (or range-Doppler) coordinate system**. The SAR image is a 2D array indexed by these two quantities.
 
-ISCE3 uses the **Zero-Doppler convention** for azimuth time, consistent with ESA sensors (Sentinel-1, ERS, ENVISAT, TerraSAR-X, COSMO-SkyMed) and JAXA ALOS-2 PALSAR L1.1 products. In this convention, the azimuth time of a given target corresponds to the moment of closest approach between the satellite and the target (i.e., when the Doppler centroid is zero).
+ISCE3 uses the **Zero-Doppler convention** for azimuth time, consistent with ESA sensors (Sentinel-1, ERS, ENVISAT, TerraSAR-X, COSMO-SkyMed) and JAXA ALOS-2 PALSAR L1.1 products. In this convention, the azimuth time of a given target corresponds to the moment of **closest approach** between the satellite and the target (i.e., when the Doppler centroid is zero, meaning there is no along-track component of relative motion).
 
 ### 4.2 Radar Grid and Range-Doppler Coordinates
 
-The radar grid is defined by:
+The radar grid describing an SLC image is fully specified by:
 
 - **Sensing start time** — UTC time of the first azimuth line.
-- **PRF (Pulse Repetition Frequency)** — determines the azimuth sampling rate.
-- **Starting slant range** — distance to the first range sample.
-- **Range sampling rate** — speed-of-light / (2 × range bandwidth).
+- **PRF (Pulse Repetition Frequency)** — determines the azimuth sampling interval (1/PRF seconds per line).
+- **Starting slant range** — distance from the antenna to the first range sample (metres).
+- **Range sampling rate** — $c / (2 \times \text{range bandwidth})$, giving the range sample spacing in metres.
 - **Number of azimuth lines and range samples** — image dimensions.
-- **Look side** — whether the sensor looks to the LEFT or RIGHT of the flight path.
-- **Wavelength / center frequency** — the radar carrier frequency.
+- **Look side** — whether the sensor looks to the LEFT or RIGHT of the flight direction.
+- **Wavelength / centre frequency** — the radar carrier frequency, which determines the phase-to-range conversion.
+
+In ISCE3 these parameters are encapsulated in `isce3.product.RadarGridParameters`:
+
+```python
+import isce3
+
+radar_grid = isce3.product.RadarGridParameters(
+    sensing_start  = isce3.core.DateTime("2021-06-15T10:30:00.000"),
+    wavelength     = 0.2385,           # L-band (metres)
+    prf            = 1520.0,           # pulses per second
+    starting_range = 900000.0,         # metres
+    range_pixel_spacing = 6.25,        # metres
+    lookside       = isce3.core.LookSide.Left,
+    length         = 10000,            # azimuth lines
+    width          = 20000             # range samples
+)
+```
 
 ### 4.3 Map Coordinates and Projections
 
 Geocoded products are expressed in a geographic or projected coordinate reference system (CRS), such as:
 
 - **WGS84 geographic** (EPSG:4326) — latitude, longitude, ellipsoidal height.
-- **UTM zones** — meter-based projected coordinates.
-- **Polar stereographic** — used in polar regions.
+- **UTM zones** (EPSG:326xx / 327xx) — metre-based projected coordinates, best for local scenes.
+- **Polar stereographic** (EPSG:3031 / 3413) — used for polar regions.
 
-ISCE3 uses **GDAL** for all CRS handling, so any EPSG-registered projection can be used. DEMs provided as input must be co-registered to the **WGS84 ellipsoid** (heights above WGS84, not geoid-referenced heights).
+ISCE3 uses **GDAL** for all CRS handling via the PROJ library, so any EPSG-registered projection can be used as an output grid. DEMs provided as input must be referenced to the **WGS84 ellipsoid** — heights above the ellipsoid, not geoid heights referenced to mean sea level.
 
 ### 4.4 Look Side Convention
 
@@ -300,37 +334,41 @@ ISCE3 defines look side using the `isce3.core.LookSide` enumeration:
 import isce3
 
 # Right-looking (most common for spaceborne SAR)
+# — Sentinel-1, NISAR, ALOS-2, TerraSAR-X
 look = isce3.core.LookSide.Right
 
 # Left-looking
+# — UAVSAR in standard configuration, some airborne systems
 look = isce3.core.LookSide.Left
 ```
+
+Specifying the wrong look side will cause backprojection and geo2rdr to look in the wrong direction; all pixels will fail to converge and the output will be empty.
 
 ---
 
 ## 5. Core Modules (`isce3.core`)
 
-The `isce3.core` module provides the fundamental data structures used throughout the library. These classes encapsulate sensor metadata and mathematical utilities.
+The `isce3.core` module provides the fundamental data structures used throughout the library. These classes encapsulate sensor metadata and mathematical utilities shared across all processing modules.
 
 ### 5.1 Orbit
 
-The `Orbit` class stores a time series of satellite state vectors (position and velocity in an Earth-Centered Earth-Fixed (ECEF) coordinate system) and provides methods for interpolating the satellite position and velocity at arbitrary times.
+The `Orbit` class stores a time series of satellite **state vectors** (position and velocity in Earth-Centered Earth-Fixed (ECEF) Cartesian coordinates) and provides interpolation at arbitrary times. Orbit accuracy directly determines geolocation accuracy; ISCE3 typically achieves millimetre-level geolocation from precision orbit products (POD) with state vectors spaced ≤ 30 seconds apart.
 
 ```python
 import isce3
 
+# Build an orbit from a list of state vectors
 times = [
     isce3.core.DateTime("2021-01-01T00:00:00.000000000"),
     isce3.core.DateTime("2021-01-01T00:00:10.000000000"),
     isce3.core.DateTime("2021-01-01T00:00:20.000000000"),
 ]
-
-positions = [
+positions = [          # ECEF metres
     [-2412125.5, -4898625.0, 4786555.5],
     [-2411850.0, -4900100.0, 4785950.0],
     [-2411575.0, -4901575.0, 4785345.0],
 ]
-velocities = [
+velocities = [         # ECEF m/s
     [2750.0, -1480.0, -610.0],
     [2750.5, -1479.5, -610.5],
     [2751.0, -1479.0, -611.0],
@@ -343,166 +381,304 @@ orbit = isce3.core.Orbit(
     ]
 )
 
-# Interpolate at a given time
+# Interpolate position and velocity at any time within the orbit span
 t_interp = isce3.core.DateTime("2021-01-01T00:00:05.000000000")
 pos, vel = orbit.interpolate(t_interp)
-print(f"Position: {pos}")
-print(f"Velocity: {vel}")
+print(f"Position (m): {pos}")
+print(f"Velocity (m/s): {vel}")
+
+# Check orbit time span
+print(f"Start: {orbit.start_time}")
+print(f"End:   {orbit.end_time}")
 ```
 
-Supported interpolation methods include Hermite (cubic) and Legendre polynomial interpolation.
+The default interpolation method is **Hermite cubic**, which guarantees position and velocity continuity at each state vector epoch. Legendre polynomial interpolation is also supported for high-precision applications.
 
 ### 5.2 Ellipsoid
 
-The `Ellipsoid` class represents a reference ellipsoid for geodetic computations. By default, ISCE3 uses WGS84.
+The `Ellipsoid` class represents a reference ellipsoid for geodetic coordinate transformations. All geometry computations in ISCE3 use WGS84 by default.
 
 ```python
 import isce3
 
+# Default WGS84 ellipsoid
 ellipsoid = isce3.core.Ellipsoid()
-print(ellipsoid.a)    # 6378137.0 (semi-major axis, meters)
-print(ellipsoid.e2)   # eccentricity squared
+print(f"Semi-major axis a: {ellipsoid.a} m")     # 6,378,137.0 m
+print(f"Eccentricity² e²: {ellipsoid.e2}")        # 0.00669437999014
 
-# Convert ECEF to lat/lon/height
-lat, lon, height = ellipsoid.xyz_to_lon_lat([-2412125.5, -4898625.0, 4786555.5])
+# Convert ECEF (x, y, z) → geodetic (longitude, latitude, height)
+xyz = [-2412125.5, -4898625.0, 4786555.5]
+lon, lat, height = ellipsoid.xyz_to_lon_lat(xyz)
+print(f"Lon: {lon:.6f}°  Lat: {lat:.6f}°  H: {height:.2f} m")
 
-# Convert lat/lon/height to ECEF
-xyz = ellipsoid.lon_lat_to_xyz([lon, lat, height])
+# Convert geodetic → ECEF
+xyz_back = ellipsoid.lon_lat_to_xyz([lon, lat, height])
+
+# Custom ellipsoid (e.g., GRS80)
+grs80 = isce3.core.Ellipsoid(a=6378137.0, e2=0.00669438002290)
 ```
 
 ### 5.3 DateTime and TimeDelta
 
-ISCE3 uses its own high-precision time classes to avoid floating-point precision loss in UTC timestamps.
+ISCE3 uses its own high-precision time classes with nanosecond resolution, avoiding the floating-point precision limitations of standard Python `datetime` objects (which are only microsecond-precise and accumulate rounding errors over long time spans).
 
 ```python
 import isce3
 
+# Construct from ISO 8601 string (nanosecond precision)
 t = isce3.core.DateTime("2021-06-15T10:30:00.123456789")
+
+# Arithmetic
 dt = isce3.core.TimeDelta(seconds=5.5)
 t2 = t + dt
+t3 = t - dt
 
-diff = t2 - t
-print(diff.total_seconds())  # 5.5
-print(str(t))
+# Difference between two DateTimes → TimeDelta
+delta = t2 - t
+print(f"Elapsed: {delta.total_seconds()} s")   # 5.5
+
+# Comparison
+print(t2 > t)   # True
+
+# Format as ISO string
+print(str(t))   # 2021-06-15T10:30:00.123456789
+
+# Days, hours, minutes access
+print(t.day, t.hour, t.minute, t.second)
 ```
 
 ### 5.4 LUT1d and LUT2d
 
-Lookup tables store slowly varying quantities that need to be sampled efficiently at arbitrary coordinates. `LUT2d` indexes by azimuth time and slant range.
+Lookup tables store quantities that vary slowly in one or two dimensions and need to be evaluated efficiently at arbitrary coordinates by interpolation. They are used throughout ISCE3 to represent quantities such as Doppler centroid, azimuth FM rate, and ionospheric/tropospheric delay corrections.
+
+`LUT2d` is a 2D lookup table indexed by **(azimuth time, slant range)**:
 
 ```python
 import isce3
 import numpy as np
 
-data = np.zeros((100, 500), dtype=np.float64)
+# Example: Doppler centroid as a function of azimuth time and slant range
+n_az = 100   # number of azimuth entries
+n_rg = 500   # number of range entries
+
+az_start   = 0.0       # seconds (from sensing start epoch)
+az_spacing = 0.1       # seconds between entries
+rg_start   = 800000.0  # metres
+rg_spacing = 1000.0    # metres between entries
+
+data = np.zeros((n_az, n_rg), dtype=np.float64)  # fill with your values
 
 lut = isce3.core.LUT2d(
-    x_start=800000.0,   # range start (meters)
-    x_spacing=10.0,
-    y_start=0.0,        # azimuth start (seconds)
-    y_spacing=1.0,
-    data=data
+    x_start   = rg_start,
+    x_spacing = rg_spacing,
+    y_start   = az_start,
+    y_spacing = az_spacing,
+    data      = data
 )
 
-value = lut.eval(az_time=10.5, rg=810000.0)
+# Evaluate at a specific (azimuth_time, slant_range)
+value = lut.eval(az_time=5.3, rg=850000.0)
+
+# A zero-valued LUT2d (used as zero-Doppler placeholder)
+zero_doppler = isce3.core.LUT2d()
 ```
 
-Common uses: Doppler centroid, carrier phase offsets, ionospheric/tropospheric delay.
+`LUT1d` is similar but one-dimensional, indexed by a single axis (e.g., range only):
+
+```python
+import numpy as np
+
+rg_vec = np.linspace(800000.0, 900000.0, 200)
+vals   = np.zeros(200)
+lut1 = isce3.core.LUT1d(x=rg_vec, y=vals)
+val  = lut1.eval(850000.0)
+```
+
+Common uses of LUT2d in ISCE3:
+
+| Quantity | Typical source |
+|---|---|
+| Doppler centroid (Hz) | Estimated from data or orbit |
+| Azimuth FM rate (Hz/s) | Computed from orbit geometry |
+| Carrier phase correction (rad) | Solid earth tides, ionosphere |
+| Tropospheric range delay (m) | ERA-5, GACOS |
 
 ### 5.5 Poly1d and Poly2d
 
-Polynomial representations for smoothly varying quantities.
+Polynomial representations are used for smoothly varying quantities such as range-to-time mappings and antenna pattern corrections.
 
 ```python
 import isce3
 
+# Poly1d: 1D polynomial p(x) = sum_k coeffs[k] * ((x - mean)/norm)^k
 poly1 = isce3.core.Poly1d(
-    order=2,
-    mean=0.0,
-    norm=1.0,
-    coeffs=[1.0, 2.0, 3.0]  # 1 + 2x + 3x^2
+    order  = 2,
+    mean   = 0.0,    # x-axis centering
+    norm   = 1.0,    # x-axis normalisation
+    coeffs = [1.0, 2.0, 3.0]   # constant, linear, quadratic
 )
-print(poly1.eval(2.0))  # 17.0
+# Evaluates: 1 + 2*(x-0)/1 + 3*((x-0)/1)^2
+print(poly1.eval(2.0))   # 1 + 4 + 12 = 17.0
+
+# Poly2d: 2D polynomial p(az, rg)
+# Used for Doppler centroid polynomials, antenna phase patterns, etc.
+poly2 = isce3.core.Poly2d(
+    azimuth_order = 1,
+    range_order   = 1,
+    az_mean       = 0.0,
+    rg_mean       = 0.0,
+    az_norm       = 1.0,
+    rg_norm       = 1.0,
+    coeffs        = [[1.0, 0.5],   # row: azimuth power, col: range power
+                     [0.2, 0.1]]
+)
+val = poly2.eval(az=1.0, rg=2.0)
 ```
 
 ### 5.6 Interpolation
 
-Available interpolation kernels:
-
-| Kernel | Class | Description |
-|---|---|---|
-| Bilinear | `isce3.core.BilinearInterpolator` | Fast, 2×2 stencil |
-| Bicubic | `isce3.core.BicubicInterpolator` | Smooth, 4×4 stencil |
-| Sinc | `isce3.core.Sinc2dInterpolator` | Band-limited, configurable kernel length |
-| Nearest neighbor | `isce3.core.NearestNeighborInterpolator` | Fastest, no smoothing |
-
-### 5.7 Attitude
-
-The `Attitude` class stores a time series of platform orientations and provides interpolation.
+`isce3.core` provides several interpolation kernels that are used throughout the library for both image resampling and lookup table evaluation. The choice of kernel involves a trade-off between computational cost, aliasing suppression, and phase accuracy.
 
 ```python
 import isce3
+import numpy as np
 
-attitude = isce3.core.Attitude(time=[...], euler_angles=[...])
-rpy = attitude.interpolate(t)  # returns (roll, pitch, yaw)
+# Sinc interpolator — best phase accuracy, 9-tap kernel
+sinc_kernel = isce3.core.Sinc2dInterpolator(sincLen=9, sincSub=1024)
+
+# Bilinear interpolator — fast, low accuracy
+bilinear = isce3.core.BilinearInterpolator()
+
+# Bicubic interpolator — smooth, moderate accuracy
+bicubic = isce3.core.BicubicInterpolator()
+
+# Nearest-neighbour — fastest, use only for masks/labels
+nearest = isce3.core.NearestNeighborInterpolator()
+
+# Using a kernel to interpolate a 2D array at a sub-pixel location
+data = np.random.randn(100, 100).astype(np.float64)
+value = sinc_kernel.interpolate(x=50.3, y=25.7, array=data)
+```
+
+Kernel comparison:
+
+| Kernel | Class | Taps | PSLR (dB) | Use case |
+|---|---|---|---|---|
+| Sinc (9-tap) | `Sinc2dInterpolator` | 9 | −26 | InSAR, SLC resampling |
+| Lanczos | `Sinc2dInterpolator` (windowed) | 8 | −24 | General purpose |
+| Bicubic | `BicubicInterpolator` | 4 | −22 | DEM, amplitude imagery |
+| Bilinear | `BilinearInterpolator` | 2 | −13 | Fast low-accuracy preview |
+| Nearest | `NearestNeighborInterpolator` | 1 | — | Masks, labels |
+
+### 5.7 Attitude
+
+The `Attitude` class stores a time series of platform orientation (roll, pitch, yaw angles or quaternions) and provides interpolation at arbitrary times. Attitude data is used for antenna pattern correction, Faraday rotation estimation, and precise beam pointing in spotlight modes.
+
+```python
+import isce3
+import numpy as np
+
+# Construct attitude from Euler angle time series (radians)
+times = [
+    isce3.core.DateTime("2021-01-01T00:00:00.000"),
+    isce3.core.DateTime("2021-01-01T00:00:10.000"),
+]
+# Each row: [roll, pitch, yaw] in radians
+euler_angles = [
+    [0.001, 0.002, 1.57],
+    [0.001, 0.002, 1.57],
+]
+
+attitude = isce3.core.Attitude(
+    time         = times,
+    euler_angles = euler_angles
+)
+
+# Interpolate at a specific time
+t = isce3.core.DateTime("2021-01-01T00:00:05.000")
+roll, pitch, yaw = attitude.interpolate(t)
+print(f"Roll: {roll:.5f} rad  Pitch: {pitch:.5f} rad  Yaw: {yaw:.5f} rad")
 ```
 
 ---
 
 ## 6. Geometry Module (`isce3.geometry`)
 
-The geometry module implements transformations between radar (range-Doppler) and map (geographic) coordinate systems.
+The geometry module implements the mathematical transformations between radar (range-Doppler) and map (geographic) coordinate systems. These transformations are the foundation of geocoding, coregistration, and DEM-based simulation workflows.
 
 ### 6.1 rdr2geo (Topo / Forward Geometry)
 
-Maps a radar-coordinate point (azimuth time, slant range) to geographic coordinates (lat, lon, height). Requires a DEM.
+**Forward geometry** maps a point in radar coordinates (azimuth time, slant range) to geographic coordinates (longitude, latitude, height above the ellipsoid). Because there are infinite geographic points at the same (azimuth time, slant range) along the iso-range cone, a DEM is required to resolve the ambiguity.
 
 ```python
 import isce3
 
 ellipsoid = isce3.core.Ellipsoid()
-doppler = isce3.core.LUT2d()  # zero Doppler
+doppler   = isce3.core.LUT2d()   # zero-Doppler (most spaceborne cases)
 
+# Single-pixel forward geometry
 lon, lat, height = isce3.geometry.rdr2geo(
-    azimuth_time=10.5,
-    slant_range=850000.0,
-    orbit=orbit,
-    ellipsoid=ellipsoid,
-    doppler=doppler,
-    wavelength=0.056,
-    side=isce3.core.LookSide.Right,
-    threshold=1e-8,
-    maxiter=50,
-    extraiter=10
+    azimuth_time = 10.5,          # seconds from sensing start
+    slant_range  = 850000.0,      # metres
+    orbit        = orbit,
+    ellipsoid    = ellipsoid,
+    doppler      = doppler,
+    wavelength   = 0.2385,        # L-band (metres)
+    side         = isce3.core.LookSide.Left,
+    threshold    = 1e-8,          # convergence threshold (metres)
+    maxiter      = 50,
+    extraiter    = 10
 )
+print(f"Lat: {lat:.6f}°  Lon: {lon:.6f}°  H: {height:.2f} m")
 ```
 
-The `Topo` class processes a full image block and writes output layers: latitude, longitude, height, local incidence angle, heading, slope, and shadow/layover masks.
+For full-image processing, the `Topo` class processes the entire radar grid and writes output layers:
+
+| Output layer | Contents |
+|---|---|
+| Latitude | Geodetic latitude (degrees) |
+| Longitude | Geodetic longitude (degrees) |
+| Height | Ellipsoidal height (metres) |
+| Incidence angle | Local incidence angle (degrees) |
+| Heading angle | Satellite heading at each pixel |
+| Slope | Terrain slope angle (degrees) |
+| Shadow/layover mask | 0=valid, 1=shadow, 2=layover, 3=both |
 
 ### 6.2 geo2rdr (Inverse Geometry)
 
-Maps a geographic point back to radar coordinates. Used for coregistration and simulation.
+**Inverse geometry** maps a geographic point (longitude, latitude, height) back to radar coordinates (azimuth time, slant range). This is used for coregistration (computing where a secondary image pixel falls in the reference grid) and DEM-based simulation.
+
+ISCE3 solves this with Newton's method iteration on the range-Doppler equations:
 
 ```python
 import isce3
 
 az_time, slant_range = isce3.geometry.geo2rdr(
-    lon=lon,
-    lat=lat,
-    height=height,
-    orbit=orbit,
-    ellipsoid=ellipsoid,
-    doppler=doppler,
-    wavelength=0.056,
-    side=isce3.core.LookSide.Right,
-    threshold=1e-8,
-    maxiter=50
+    lon       = -117.5,       # degrees
+    lat       = 34.2,
+    height    = 150.0,        # metres
+    orbit     = orbit,
+    ellipsoid = ellipsoid,
+    doppler   = doppler,
+    wavelength = 0.2385,
+    side      = isce3.core.LookSide.Left,
+    threshold = 1e-8,
+    maxiter   = 50,
+    delta_range = 1e-8        # numerical step for Jacobian (metres)
 )
+print(f"Azimuth time: {az_time:.6f} s  Slant range: {slant_range:.2f} m")
 ```
+
+> **Convergence tip:** Increase `maxiter` to 100 for high-squint geometries or polar scenes. If geo2rdr returns NaN, the target is outside the visible cone for that look side — check that `side` is set correctly.
 
 ### 6.3 Geocode
 
-Projects a radar-grid raster into a geographic map grid.
+The `Geocode` class projects a radar-grid raster into a regular geographic map grid. For each output map pixel, it uses geo2rdr to determine the corresponding radar pixel, then interpolates the radar image value.
+
+Two geocoding strategies are available:
+
+- **Interpolation mode** — for SLC, phase, and coherence products where phase preservation matters.
+- **Area-projection mode** — for backscatter (GCOV) where radiometric accuracy (proper area normalisation) matters.
 
 ```python
 import isce3
@@ -511,39 +687,51 @@ geocode = isce3.geocode.GeocodeFloat32()
 geocode.orbit     = orbit
 geocode.ellipsoid = ellipsoid
 geocode.doppler   = doppler
+geocode.threshold = 1e-8
+geocode.maxiter   = 50
 
+# Define the output geographic grid
 geocode.geogrid(
-    x_start=-120.0, y_start=35.0,
-    x_end=-118.0,   y_end=37.0,
-    x_spacing=0.0001, y_spacing=0.0001,
-    epsg=4326
+    x_start   = -120.0,    # west longitude (degrees)
+    y_start   =   34.0,    # south latitude (degrees)
+    x_end     = -118.0,    # east longitude
+    y_end     =   36.0,    # north latitude
+    x_spacing =  0.0001,   # ~11 m at mid-latitudes
+    y_spacing =  0.0001,
+    epsg      =  4326
 )
 
 geocode.geocode(
-    radar_grid=radar_grid,
-    input_raster=input_raster,
-    output_raster=output_raster,
-    dem_raster=dem_raster,
-    output_mode=isce3.geocode.GeocodeOutputMode.Interp
+    radar_grid    = radar_grid,
+    input_raster  = input_raster,
+    output_raster = output_raster,
+    dem_raster    = dem_raster,
+    output_mode   = isce3.geocode.GeocodeOutputMode.Interp
 )
 ```
 
+For multi-band products (e.g., all GCOV polarisation channels), the geocoding loop is run once per band.
+
 ### 6.4 DEMs and Height References
 
-DEMs must be:
+DEMs must satisfy the following requirements for use with ISCE3:
 
-- Referenced to the **WGS84 ellipsoid** (not mean sea level). Convert geoid-referenced DEMs before use.
-- In a **GDAL-readable format** (GeoTIFF recommended) with a valid EPSG code.
-- Covering the full scene footprint plus margin.
+- Referenced to the **WGS84 ellipsoid** (heights above ellipsoid, not mean sea level). SRTM and older DEMs are geoid-referenced (EGM96); convert them with a geoid undulation model before use.
+- In a **GDAL-readable format** (GeoTIFF recommended).
+- Have a correctly set **EPSG projection code** in the metadata.
+- **Cover the full scene footprint** plus at least 0.5° margin in all directions (more for wide-swath sensors at steep incidence).
 
-Recommended global DEMs:
+Recommended global DEMs compatible with ISCE3:
 
-| DEM | Resolution | Notes |
-|---|---|---|
-| Copernicus DEM (GLO-30) | 30 m | Ellipsoid-referenced, excellent global coverage |
-| NASADEM | 30 m | Ellipsoid-referenced, SRTM-based |
-| SRTM v3 | 30 m | Geoid-referenced (EGM96) — requires conversion |
-| ALOS World 3D (AW3D30) | 30 m | Ellipsoid-referenced |
+| DEM | Resolution | Height ref | Notes |
+|---|---|---|---|
+| Copernicus DEM (GLO-30) | 30 m | WGS84 ellipsoid | Best overall; ISCE3 default |
+| NASADEM | 30 m | WGS84 ellipsoid | SRTM-based, good coverage |
+| ALOS World 3D (AW3D30) | 30 m | WGS84 ellipsoid | Good in vegetated areas |
+| SRTM v3 | 30 m | EGM96 geoid | **Requires conversion** before use |
+| TanDEM-X 90 m | 90 m | WGS84 ellipsoid | Global, consistent quality |
+
+A height reference error of $\Delta h$ metres produces a ground-range geolocation error of approximately $\Delta h / \tan\theta_i$, where $\theta_i$ is the local incidence angle.
 
 ---
 
@@ -551,56 +739,114 @@ Recommended global DEMs:
 
 ### 7.1 Raster
 
-The `Raster` class wraps GDAL raster datasets.
+The `Raster` class is ISCE3's primary interface for reading and writing gridded image data. It wraps GDAL datasets and is accepted by all geometry, signal processing, and geocoding modules.
 
 ```python
 import isce3
 import numpy as np
 
-# Open for reading
+# ── Open an existing raster for reading ──────────────────────────────────────
 raster_in = isce3.io.Raster("/path/to/input.tif")
-print(raster_in.width, raster_in.length, raster_in.num_bands)
+print(f"Width:  {raster_in.width}")
+print(f"Length: {raster_in.length}")
+print(f"Bands:  {raster_in.num_bands}")
+print(f"EPSG:   {raster_in.get_epsg()}")
+print(f"Dtype:  {raster_in.dtype}")
 
-# Create output raster
+# ── Create a new output raster ────────────────────────────────────────────────
 raster_out = isce3.io.Raster(
     "/path/to/output.tif",
-    width=1000, length=500, num_bands=1,
-    dtype=isce3.io.gdal_dtype.Float32,
-    driver_name="GTiff"
+    width       = 1000,
+    length      = 500,
+    num_bands   = 1,
+    dtype       = isce3.io.gdal_dtype.Float32,
+    driver_name = "GTiff"
 )
 
-# Read/write arrays
+# ── Read a band as a NumPy array ─────────────────────────────────────────────
 data = np.zeros((raster_in.length, raster_in.width), dtype=np.float32)
 raster_in.get_array(band=1, data=data)
+
+# ── Write a NumPy array to a band ────────────────────────────────────────────
 raster_out.set_array(band=1, data=data)
+
+# ── Set geotransform and projection ──────────────────────────────────────────
+raster_out.set_epsg(4326)
+raster_out.set_geotransform([-120.0, 0.0001, 0.0, 36.0, 0.0, -0.0001])
 ```
+
+Supported GDAL data types:
+
+| `isce3.io.gdal_dtype` | NumPy equivalent | Typical use |
+|---|---|---|
+| `Byte` | `uint8` | Masks, labels |
+| `Int16` | `int16` | Quantised offsets |
+| `Float32` | `float32` | Coherence, backscatter |
+| `Float64` | `float64` | High-precision geometry layers |
+| `CFloat32` | `complex64` | SLC, interferogram |
+| `CFloat64` | `complex128` | High-precision interferometry |
 
 ### 7.2 HDF5 and NISAR Product Files
 
-All NISAR products use HDF5 with a hierarchical group structure:
+All NISAR standard products use HDF5 with a hierarchical group structure. The top-level paths follow the pattern `/science/{band}/{product}/`.
 
 ```
 /science/
-  LSAR/
+  LSAR/                              # L-band data
     RSLC/
       metadata/
-        orbit/          # State vectors
+        orbit/
+          position                   # float64 (M, 3) — ECEF metres
+          velocity                   # float64 (M, 3) — ECEF m/s
+          time                       # float64 (M,)   — seconds from epoch
+          orbitType                  # "POE" | "RES" | "PRE"
         attitude/
+          eulerAngles                # float64 (M, 3) — roll, pitch, yaw (rad)
+          time
+        processingInformation/
+          parameters/
+            centerFrequency          # Hz
+            rangeBandwidth           # Hz
+            azimuthBandwidth         # Hz
+            slantRangeSpacing        # m
+            zeroDopplerTimeSpacing   # s
       swaths/
         frequencyA/
-          HH/           # Complex SLC data
+          centerFrequency            # scalar Hz
+          processedRangeBandwidth
+          processedAzimuthBandwidth
+          HH/                        # polarization channel
+            (complex64 SLC array)
+          HV/
+          ...
         frequencyB/
           ...
+  SSAR/                              # S-band data (NISAR)
+    ...
 ```
+
+Reading product data:
 
 ```python
 import h5py
+import numpy as np
 
 with h5py.File("NISAR_RSLC.h5", "r") as f:
+    # Read SLC image (complex64)
     slc  = f["/science/LSAR/RSLC/swaths/frequencyA/HH"][:]
-    pos  = f["/science/LSAR/RSLC/metadata/orbit/position"][:]
-    vel  = f["/science/LSAR/RSLC/metadata/orbit/velocity"][:]
-    time = f["/science/LSAR/RSLC/metadata/orbit/time"][:]
+
+    # Read orbit state vectors
+    pos  = f["/science/LSAR/RSLC/metadata/orbit/position"][:]   # (M, 3)
+    vel  = f["/science/LSAR/RSLC/metadata/orbit/velocity"][:]   # (M, 3)
+    time = f["/science/LSAR/RSLC/metadata/orbit/time"][:]       # (M,)
+
+    # Read range and azimuth coordinate vectors
+    rg   = f["/science/LSAR/RSLC/swaths/frequencyA/slantRange"][:]
+    az   = f["/science/LSAR/RSLC/swaths/frequencyA/zeroDopplerTime"][:]
+
+    fc   = f["/science/LSAR/RSLC/swaths/frequencyA/centerFrequency"][()]
+    print(f"Carrier frequency: {fc/1e9:.4f} GHz")
+    print(f"SLC shape: {slc.shape}  dtype: {slc.dtype}")
 ```
 
 ---
@@ -609,60 +855,105 @@ with h5py.File("NISAR_RSLC.h5", "r") as f:
 
 ### 8.1 Cross-Multiplication (crossmul)
 
-Forms a complex interferogram by multiplying the reference SLC by the complex conjugate of the secondary SLC.
+Cross-multiplication forms the complex interferogram by multiplying the reference SLC by the complex conjugate of the secondary SLC. It is the central operation in InSAR processing and includes optional multi-looking.
 
 ```python
 import isce3
 
 crossmul = isce3.signal.Crossmul()
+
 crossmul.crossmul(
-    referenceSLC=ref_raster,
-    secondarySLC=sec_raster,
-    interferogram=ifgram_raster,
-    coherence=coh_raster,
-    rangeLooks=5,
-    azimuthLooks=5,
-    refDoppler=ref_doppler,
-    secDoppler=sec_doppler,
-    wavelength=wavelength
+    referenceSLC  = ref_raster,       # isce3.io.Raster, complex64
+    secondarySLC  = sec_raster,       # co-registered secondary SLC
+    interferogram = ifgram_raster,    # output interferogram
+    coherence     = coh_raster,       # output coherence (0–1)
+    rangeLooks    = 5,                # multi-look factor in range
+    azimuthLooks  = 5,                # multi-look factor in azimuth
+    refDoppler    = ref_doppler,      # LUT2d: reference Doppler centroid (Hz)
+    secDoppler    = sec_doppler,      # LUT2d: secondary Doppler centroid (Hz)
+    wavelength    = 0.2385            # carrier wavelength (metres)
 )
 ```
 
-Multi-looking during crossmul reduces speckle noise at the cost of spatial resolution.
+**Multi-looking** during crossmul spatially averages the complex product over `rangeLooks × azimuthLooks` pixels before computing the magnitude (coherence). This reduces speckle noise and improves phase quality at the cost of spatial resolution. Typical look numbers for NISAR: 11 (range) × 3 (azimuth) to produce ~80 m posting.
 
 ### 8.2 Filtering
 
-ISCE3 provides range and azimuth spectral filters:
+ISCE3 provides spectral filters applied before crossmul to maximise interferometric coherence:
 
-- **Range spectral filtering** — retains only the common spectral overlap between reference and secondary, reducing spatial-baseline decorrelation noise.
-- **Azimuth spectral filtering** — removes Doppler centroid differences.
-- **Goldstein adaptive interferogram filter** — enhances interferometric phase quality.
+**Range spectral filtering** removes the spectral portion of each SLC that does not overlap with the other — necessary when the two acquisitions have a non-zero perpendicular baseline, which shifts the range spectra relative to each other. The common bandwidth is estimated from the baseline and incidence angle:
+
+```python
+import isce3
+
+# Apply common-band range filter to reference SLC
+filt = isce3.signal.Filter()
+filt.filter_frequency(
+    input_raster      = ref_slc_raster,
+    output_raster     = ref_filtered_raster,
+    rng_bandwidth     = common_bw_hz,       # common range bandwidth (Hz)
+    center_frequency  = fc_ref,             # sub-band centre frequency (Hz)
+    sampling_rate     = range_sampling_hz
+)
+```
+
+**Azimuth spectral (common-band Doppler) filtering** is applied when the two SLCs have different Doppler centroids (different squint angles or acquisition modes). Only the overlapping azimuth bandwidth contributes coherently:
+
+```python
+# Apply azimuth filter to align Doppler spectra
+filt.bandpass_filter_azimuth(
+    input_raster      = ref_slc_raster,
+    output_raster     = ref_az_filtered,
+    doppler_centroid  = fdc_ref,            # Hz
+    bandwidth         = common_az_bw,       # Hz
+    prf               = prf_hz
+)
+```
+
+**Goldstein adaptive interferogram filter** enhances interferometric phase quality after crossmul by suppressing noise in incoherent regions while preserving fringe detail in coherent regions:
+
+```python
+import isce3
+
+goldstein = isce3.signal.Goldstein()
+goldstein.filter(
+    interferogram    = ifgram_raster,
+    coherence        = coh_raster,
+    filtered_igram   = filtered_raster,
+    alpha            = 0.5,    # filter strength: 0 (off) to 1 (max)
+    block_size       = 32,     # FFT block size (pixels)
+    overlap          = 4       # overlap between blocks (pixels)
+)
+```
 
 ### 8.3 Resampling
 
-Resamples an SLC from its native radar grid to a coregistered grid aligned with a reference image.
+Coregistration resamples the secondary SLC from its native radar grid onto the reference image grid. This is driven by pixel offset maps (range and azimuth) computed either geometrically (geo2rdr) or by cross-correlation (ampcor).
 
 ```python
 import isce3
 
 resamp = isce3.image.ResampSlc(
-    radar_grid=radar_grid,
-    doppler=doppler,
-    wavelength=wavelength
+    radar_grid = radar_grid,     # secondary radar grid
+    doppler    = sec_doppler,    # secondary Doppler LUT
+    wavelength = 0.2385
 )
+
 resamp.resamp(
-    inputFilename=secondary_slc_path,
-    outputFilename=coregistered_slc_path,
-    rgoffFilename=range_offset_path,
-    azoffFilename=azimuth_offset_path,
-    num_lines=lines,
-    num_subswaths=1
+    inputFilename    = "/path/to/secondary.slc",
+    outputFilename   = "/path/to/coregistered.slc",
+    rgoffFilename    = "/path/to/range_offsets.off",   # float32 range pixel offsets
+    azoffFilename    = "/path/to/azimuth_offsets.off", # float32 azimuth pixel offsets
+    num_lines        = radar_grid.length,
+    num_subswaths    = 1
 )
 ```
 
+The offset files contain fractional pixel shifts in the range and azimuth directions, positive meaning the secondary pixel is shifted to higher index. Sub-pixel interpolation uses the sinc kernel (configurable via the `kernel` parameter).
+
 ### 8.4 Backprojection
 
-A time-domain SAR focusing algorithm. Geometrically exact and suited for non-linear trajectories (e.g., airborne platforms).
+A time-domain SAR focusing algorithm. Geometrically exact and particularly well suited for non-linear trajectories (airborne platforms), high-squint geometries, and spotlight modes.
 
 > 📄 **Deep-dive available:** See the [ISCE3 Backprojection Algorithm — Technical Reference](isce3_backprojection_technical_reference.md) for a full treatment of the governing equations, orbit interpolation, GPU parallelisation, interpolation kernels, InSAR phase preservation, and extended API usage.
 
@@ -670,273 +961,456 @@ A time-domain SAR focusing algorithm. Geometrically exact and suited for non-lin
 import isce3
 
 isce3.focus.backproject(
-    output=output_raster,
-    input=raw_raster,
-    orbit=orbit,
-    doppler=doppler,
-    dem=dem_raster,
-    ellipsoid=ellipsoid,
-    fc=center_freq,
-    dt=prf_inverse,
-    dr=range_spacing
+    output     = output_raster,     # pre-allocated complex64 output SLC
+    input      = rc_raster,         # range-compressed input data
+    orbit      = orbit,
+    doppler    = doppler,           # Doppler centroid LUT2d (use LUT2d() for zero)
+    dem        = dem_raster,
+    ellipsoid  = isce3.core.Ellipsoid(),
+    fc         = 1.2575e9,          # carrier frequency (Hz)
+    dt         = 1.0 / 1520.0,     # azimuth sample spacing (s) = 1/PRF
+    dr         = 1.0 / 180e6,      # range sample spacing (s) = 1/fs
+    side       = isce3.core.LookSide.Left,
+    threshold  = 1e-8,
+    maxiter    = 50,
+    flatten    = True,              # remove flat-earth phase
+    kernel     = isce3.core.Sinc2dInterpolator(sincLen=9, sincSub=1024)
 )
 ```
 
 ### 8.5 Split-Spectrum
 
-Separates the radar signal into sub-bands to estimate and correct ionospheric phase delay.
+Separates the full-bandwidth radar signal into low and high frequency sub-bands to estimate and correct ionospheric phase delay.
 
 > 📄 **Deep-dive available:** See the [ISCE3 Ionosphere Correction Module — Technical Reference](isce3_ionosphere_technical_reference.md) for a full treatment of plasma physics, the split-spectrum derivation, TEC estimation equations, NISAR QQP polarimetric bias, external GIM/IONEX correction, Faraday rotation, and extended API usage.
 
 ```python
 import isce3
 
-split = isce3.splitspectrum.SplitSpectrum()
-split.splitspectrum(
-    slc_raster=slc_raster,
-    low_band_raster=low_raster,
-    high_band_raster=high_raster,
-    range_bandwidth=bandwidth,
-    center_frequency=fc
+split = isce3.signal.SplitSpectrum()
+
+split.split_spectrum(
+    slc_raster        = slc_raster,         # full-band SLC
+    low_sub_raster    = low_band_raster,    # output: low sub-band SLC
+    high_sub_raster   = high_band_raster,   # output: high sub-band SLC
+    range_bandwidth   = 80.0e6,             # full range bandwidth (Hz)
+    center_frequency  = 1.2575e9,           # carrier (Hz)
+    low_sub_bw        = 20.0e6,             # low sub-band bandwidth (Hz)
+    high_sub_bw       = 20.0e6,             # high sub-band bandwidth (Hz)
+    window_function   = "cosine"
 )
 ```
 
-Sub-band SLCs are independently processed through InSAR; the differential phase estimates total electron content (TEC) for ionospheric correction.
+The sub-band SLCs are then processed through the standard InSAR chain independently, and the differential phase between the two sub-band interferograms is used to estimate the Total Electron Content (TEC) and derive an ionospheric phase correction screen.
 
 ---
 
 ## 9. Phase Unwrapping (`isce3.unwrap`)
 
-Phase unwrapping converts wrapped interferometric phase (−π to π) into an absolute phase map.
+Phase unwrapping converts the wrapped interferometric phase (restricted to $[-\pi, \pi]$) into a continuous absolute phase map. ISCE3 includes two unwrapping engines.
 
 ### ICU (Integrated Correlation and Unwrapping)
 
-Fast branch-cut algorithm using coherence as a reliability guide.
+A fast branch-cut algorithm that uses coherence as a reliability guide. Well suited for high-coherence scenes and scenes with a simple topology.
 
 ```python
 import isce3
 
-icu = isce3.unwrap.ICU(buffer_lines=3700, overlap=200)
+icu = isce3.unwrap.ICU(
+    buffer_lines = 3700,    # number of lines in the processing buffer
+    overlap      = 200      # overlap between processing tiles (lines)
+)
+
 icu.unwrap(
-    wrapped_igram=ifgram_raster,
-    coherence=coh_raster,
-    unwrapped_igram=unw_raster,
-    coherence_threshold=0.05
+    wrapped_igram    = ifgram_raster,    # complex interferogram
+    coherence        = coh_raster,       # float32 coherence (0–1)
+    unwrapped_igram  = unw_raster,       # output unwrapped phase (float32)
+    coherence_threshold = 0.05           # mask pixels below this value
 )
 ```
 
 ### SNAPHU
 
-Statistical-cost, Network-flow Algorithm for Phase Unwrapping. More robust than ICU for complex terrain or low-coherence scenes.
+Statistical-cost, Network-flow Algorithm for Phase Unwrapping. More robust than ICU for complex topography, low-coherence scenes, and large areas with many phase discontinuities, at higher computational cost.
 
 ```python
 import isce3
 
 snaphu = isce3.unwrap.snaphu.Snaphu(
-    cost_mode="SMOOTH",  # or "DEFO" or "TOPO"
-    init_method="MCF"
+    cost_mode   = "SMOOTH",   # cost model: SMOOTH | DEFO | TOPO
+    init_method = "MCF"       # initialisation: MCF | MST
 )
+
 snaphu.unwrap(
-    wrapped_igram=ifgram_raster,
-    coherence=coh_raster,
-    unwrapped_igram=unw_raster,
-    nlooks=nlooks,
-    cost_threshold=100
+    wrapped_igram   = ifgram_raster,
+    coherence       = coh_raster,
+    unwrapped_igram = unw_raster,
+    nlooks          = 15,          # effective number of looks (rg × az)
+    cost_threshold  = 100
 )
 ```
 
-| SNAPHU mode | Best for |
-|---|---|
-| `SMOOTH` | Slowly varying / smooth deformation |
-| `DEFO` | Earthquake, subsidence, rapid deformation |
-| `TOPO` | Topographic phase (baseline-dominated) |
+SNAPHU cost mode guide:
+
+| Mode | Best used for | Notes |
+|---|---|---|
+| `SMOOTH` | Slow deformation, subsidence | Assumes phase varies slowly |
+| `DEFO` | Earthquakes, rapid deformation | Allows sharp discontinuities |
+| `TOPO` | Topography-dominated interferograms | Optimised for high-baseline pairs |
+
+**Tiled SNAPHU** for large scenes: SNAPHU can process large interferograms in tiles to reduce memory usage, controlled via `tile_nrow` and `tile_ncol` parameters. Adjacent tiles overlap to avoid tile-edge artefacts.
 
 ---
 
 ## 10. Image Offsets and Coregistration
 
-Dense pixel offset maps are used for coregistration and for measuring surface displacement.
+Precise coregistration of the secondary SLC to the reference is essential for high-quality interferometry. ISCE3 combines two complementary approaches.
 
-**Geometric offsets** — computed analytically from geo2rdr using orbit and DEM:
+**Geometric offsets** — computed analytically using geo2rdr, orbit, and DEM. Fast, noise-free, but limited by orbit and DEM accuracy (typically sub-pixel for precision orbit products).
 
 ```python
 import isce3
 
+# Write pixel offset grids (range and azimuth shifts in pixels)
 isce3.geometry.compute_geo2rdr_offsets(
-    radar_grid=radar_grid,
-    orbit=orbit,
-    doppler=doppler,
-    ellipsoid=ellipsoid,
-    dem=dem_raster,
-    range_offset_raster=rg_off,
-    azimuth_offset_raster=az_off
+    radar_grid            = ref_radar_grid,
+    orbit                 = sec_orbit,         # secondary orbit
+    doppler               = sec_doppler,
+    ellipsoid             = isce3.core.Ellipsoid(),
+    dem                   = dem_raster,
+    range_offset_raster   = rg_off_raster,     # output: float32
+    azimuth_offset_raster = az_off_raster,     # output: float32
+    threshold             = 1e-8,
+    maxiter               = 50
 )
 ```
 
-**Correlation-based offsets (ampcor)** — cross-correlates amplitude patches, providing sub-pixel accuracy:
+**Correlation-based offsets (ampcor)** — cross-correlates amplitude patches between reference and secondary, achieving sub-pixel accuracy. Used to refine geometric offsets and to measure surface displacement.
 
 ```python
 import isce3
 
 ampcor = isce3.matchtemplate.AmpcorNormSqCorr(
-    refSlc=ref_raster,
-    secSlc=sec_raster,
-    ...
+    refSlc         = ref_raster,
+    secSlc         = sec_raster,
+    window_range   = 64,      # correlation window half-width in range (pixels)
+    window_azimuth = 64,      # correlation window half-width in azimuth
+    skip_range     = 32,      # spacing between offset estimation points
+    skip_azimuth   = 32,
+    oversampling   = 64       # sub-pixel oversampling factor
 )
 ampcor.runAmpcor()
+# Writes offset and SNR grids
 ```
 
-In production, both methods are combined: geometric offsets provide the initial estimate, ampcor refines them.
+The standard workflow applies geometric offsets as the initial estimate (passed to ampcor as the starting search centre) and uses ampcor to compute residual offsets capturing ionospheric distortion, troposphere, or orbit errors.
 
 ---
 
 ## 11. Radiometric Terrain Correction (RTC)
 
-RTC normalizes SAR backscatter for local terrain slope, removing brightness modulation caused by variable radar incidence angle.
+Radiometric Terrain Correction normalises SAR backscatter for the local terrain slope, removing the brightness variations caused by topographic facets facing toward or away from the sensor. Without RTC, steep slopes facing the radar appear brighter than flat ground, making quantitative backscatter comparison across a scene unreliable.
+
+ISCE3 supports two RTC algorithms:
 
 ```python
 import isce3
 
-# Area-projection RTC (preferred for accuracy)
+# Area-projection algorithm — geometrically exact, recommended for science
 rtc_alg = isce3.geometry.RtcAlgorithm.RtcAreaProjection
 
-# David Small method (faster approximation)
+# David Small's algorithm — faster approximation
 rtc_alg = isce3.geometry.RtcAlgorithm.RtcDavidSmallMethod
 ```
 
-Output normalization options:
+Running RTC as part of the GCOV workflow:
 
-- **Beta-nought** — raw backscatter
-- **Sigma-nought** — normalized by sin(incidence angle)
-- **Gamma-nought** — normalized by cos(local slope); most terrain-invariant
+```python
+import isce3
+
+# Compute the RTC normalisation factor (area ratio)
+rtc_area = isce3.io.Raster("rtc_area.tif", ...)
+
+isce3.geometry.compute_rtc(
+    radar_grid   = radar_grid,
+    orbit        = orbit,
+    input_raster = slc_raster,        # SLC to correct
+    output_raster = rtc_corrected,    # RTC-normalised output
+    dem          = dem_raster,
+    rtc_algorithm = isce3.geometry.RtcAlgorithm.RtcAreaProjection,
+    output_terrain_radiometry = isce3.geometry.RtcOutputTerrainRadiometry.GammaNought,
+    geogrid_upsampling = 1
+)
+```
+
+Output normalisation conventions:
+
+| Convention | Formula | Notes |
+|---|---|---|
+| Beta-nought ($\beta^0$) | Uncorrected | Brightness in slant-range geometry |
+| Sigma-nought ($\sigma^0$) | $\beta^0 / \sin\theta_i$ | Standard ground range normalisation |
+| Gamma-nought ($\gamma^0$) | $\beta^0 / \cos\alpha$ | Terrain-flattened; most stable for analysis |
+
+where $\theta_i$ is the local incidence angle and $\alpha$ is the local terrain slope angle. Gamma-nought is the preferred output for NISAR GCOV products.
 
 ---
 
 ## 12. NISAR Standard Workflows
 
+ISCE3 ships with a complete set of end-to-end workflows producing the standard NISAR Level-1 and Level-2 data products, all invoked via `python -m nisar.workflows.<name>` and configured through YAML runconfig files.
+
 ### 12.1 Product Hierarchy
 
 ```
-L0B (raw telemetry)
+L0B (raw telemetry, unfocused)
   │
-  └─► RSLC (Range-Doppler SLC)
+  └─► RSLC   Range-Doppler Single Look Complex       Level 1
         │
-        ├─► GSLC  (Geocoded SLC)
-        ├─► GCOV  (Geocoded Covariance / backscatter)
-        └─► RIFG  (Range-Doppler Interferogram, wrapped)
+        ├─► GSLC   Geocoded SLC                      Level 1
+        │
+        ├─► GCOV   Geocoded Covariance (backscatter) Level 2
+        │
+        └─► RIFG   Range-Doppler Interferogram (wrapped)   Level 2
               │
-              ├─► RUNW  (Range-Doppler Unwrapped)
-              │     └─► GUNW  (Geocoded Unwrapped Interferogram)
-              └─► ROFF  (Range-Doppler Pixel Offsets)
-                    └─► GOFF  (Geocoded Pixel Offsets)
+              ├─► RUNW   Range-Doppler Unwrapped            Level 2
+              │     └─► GUNW   Geocoded Unwrapped           Level 2
+              │
+              └─► ROFF   Range-Doppler Pixel Offsets        Level 2
+                    └─► GOFF   Geocoded Pixel Offsets       Level 2
 ```
 
 ### 12.2 RSLC — Range-Doppler Single Look Complex
 
-Focused, complex-valued SAR image in range-Doppler coordinates. The primary Level-1 output.
+The RSLC is a focused, complex-valued SAR image in range-Doppler (radar) coordinates. It is the primary Level-1 output and the input to all downstream Level-2 products.
 
 ```bash
 python -m nisar.workflows.focus --run-config-path rslc_runconfig.yaml
 ```
 
-Key steps: L0B ingest → range pulse compression → range migration → azimuth compression → Doppler estimation → (optional) RFI suppression → HDF5 output.
+Key processing steps in the RSLC workflow:
+
+1. **L0B ingest** — read raw telemetry, decode pulse data, apply calibration parameters
+2. **RFI suppression** (optional) — identify and blank radio frequency interference in the range spectrum
+3. **Range pulse compression** — matched filter the transmitted chirp to achieve range resolution
+4. **Range cell migration correction** — correct for the range walk of targets across azimuth lines
+5. **Azimuth compression** — apply the azimuth matched filter using Doppler history
+6. **Doppler centroid estimation** — estimate fDC from the data to ensure correct focusing
+7. **Multi-channel processing** (NISAR) — combine sub-apertures, handle SweepSAR timing
+8. **Output HDF5 RSLC** — write product with metadata, orbit, attitude, calibration info
 
 ### 12.3 GSLC — Geocoded SLC
 
-Resamples RSLC into a regular map grid while preserving complex phase.
+GSLC resamples the RSLC into a regular geographic map grid while preserving the complex-valued phase. It is used for polarimetric analysis, change detection, and as input to time-series analysis tools.
 
 ```bash
 python -m nisar.workflows.gslc --run-config-path gslc_runconfig.yaml
 ```
 
+Key processing steps:
+
+1. Read RSLC and build orbit/radar grid objects
+2. Compute geo2rdr pixel mapping from the output map grid to the RSLC grid
+3. Resample RSLC using sinc interpolation (phase-preserving) onto the map grid
+4. Apply optional flatten correction (remove reference ellipsoid phase ramp)
+5. Write GSLC HDF5 product
+
 ### 12.4 GCOV — Geocoded Covariance
 
-Computes the polarimetric covariance matrix from multi-polarization SLCs, geocodes it, and applies RTC.
+GCOV computes the polarimetric covariance matrix from multi-polarisation RSLC data, applies Radiometric Terrain Correction, multi-looks, and geocodes the result. It is the primary NISAR Level-2 backscatter product.
 
 ```bash
 python -m nisar.workflows.gcov --run-config-path gcov_runconfig.yaml
 ```
 
+Key processing steps:
+
+1. Read RSLC for all polarisations (HH, HV, VH, VV)
+2. Compute RTC normalisation factors from DEM and orbit
+3. Form covariance matrix elements (e.g., |HH|², |VV|², HH·VV*, |HV|²)
+4. Apply multi-looking (spatial averaging)
+5. Apply RTC (gamma-nought normalisation)
+6. Geocode to output map grid
+7. Write GCOV HDF5 including backscatter, RTC factors, local incidence angle, shadow/layover mask
+
 ### 12.5 RIFG / RUNW / GUNW — Interferograms
 
-Full InSAR chain: coregistration → crossmul (RIFG) → unwrapping (RUNW) → geocoding (GUNW).
+The full InSAR chain produces wrapped (RIFG), unwrapped range-Doppler (RUNW), and geocoded unwrapped (GUNW) interferograms from a pair of RSLCs.
 
 ```bash
 python -m nisar.workflows.insar --run-config-path insar_runconfig.yaml
 ```
 
-Optional corrections: ionospheric (split-spectrum), solid earth tides.
+Key processing steps:
+
+1. **Coregistration** — geometric offsets (geo2rdr) + dense offsets (ampcor refinement)
+2. **Resampling** — resample secondary RSLC to reference grid
+3. **Common-band filtering** — range and azimuth spectral filters to maximise coherence
+4. **Cross-multiplication** — form RIFG (wrapped interferogram) + coherence
+5. **Split-spectrum ionosphere** (optional) — estimate and write ionospheric phase screen
+6. **Phase flattening** — remove reference ellipsoid and DEM-derived topographic phase
+7. **Phase unwrapping** (ICU or SNAPHU) → RUNW
+8. **Geocoding** → GUNW (unwrapped phase on map grid, 80 m posting for NISAR)
+9. **Solid earth tide correction** (optional)
+
+The GUNW HDF5 product contains:
+
+- Unwrapped interferometric phase (rad)
+- Coherence (0–1)
+- Ionospheric phase screen (rad) — as a separate layer, not applied by default
+- Wrapped interferogram
+- Connected component labels from unwrapping
+- Local incidence angle
+- Perpendicular baseline
 
 ### 12.6 ROFF / GOFF — Pixel Offsets
 
-Measures range and azimuth surface displacement via amplitude cross-correlation.
+Pixel offset products measure range and azimuth surface displacement by cross-correlating SAR amplitude images, without requiring phase coherence.
 
 ```bash
 python -m nisar.workflows.offsets --run-config-path offsets_runconfig.yaml
 ```
 
+Key processing steps:
+
+1. Coarse geometric offsets from geo2rdr
+2. Dense pixel offsets using ampcor (cross-correlation in amplitude)
+3. SNR-based quality masking
+4. Geocoding of offset grids → GOFF
+
+ROFF/GOFF are particularly useful for:
+- Large displacements (> λ/4) that decorrelate interferograms (e.g., earthquakes, glaciers)
+- Areas of low interferometric coherence (dense vegetation, steep topography)
+- Azimuth-direction displacement measurement (InSAR is insensitive to azimuth motion)
+
 ---
 
 ## 13. Running Workflows with Runconfig YAML
 
-All workflows are configured via YAML files.
+All NISAR workflows are configured through YAML runconfig files. Each workflow has its own schema, but all follow the same hierarchical group structure.
 
 ### Example InSAR Runconfig
 
 ```yaml
 runconfig:
   name: insar_workflow
+
   groups:
+    pge_name_group:
+      pge_name: InSarPge
+
     input_file_group:
-      reference_rslc_file: /path/to/reference.h5
-      secondary_rslc_file: /path/to/secondary.h5
+      reference_rslc_file:  /data/reference_RSLC.h5
+      secondary_rslc_file:  /data/secondary_RSLC.h5
 
     dynamic_ancillary_file_group:
-      dem_file: /path/to/dem.tif
+      dem_file:             /data/dem_wgs84.tif
+      # Optional external ionosphere model
+      tec_file:             ""
 
     product_path_group:
-      product_path: /path/to/output/
-      scratch_path: /path/to/scratch/
-      sas_output_file: /path/to/output/insar_product.h5
+      product_path:         /output/
+      scratch_path:         /scratch/
+      sas_output_file:      /output/NISAR_GUNW.h5
+      sas_config_file:      /output/runconfig_used.yaml
 
     primary_executable:
-      product_type: RUNW
+      product_type: GUNW    # RIFG | RUNW | GUNW
 
     processing:
+      # Which frequency bands and polarizations to process
       process_freqs:
         - freq: A
           pols: [HH, VV]
 
+      # Coregistration
+      coarse_offsets:
+        enabled:           true
+        margin:            100        # pixels of margin around scene edge
+        window_range:      256        # correlation window size (pixels)
+        window_azimuth:    256
+        skip_range:        32         # spacing between offset estimation points
+        skip_azimuth:      32
+        oversampling:      32
+
+      dense_offsets:
+        enabled:           false      # set true for offset products
+
+      # Spectral filtering before crossmul
+      filter_interferogram:
+        filter_type:       boxcar     # boxcar | gaussian | no_filter
+        window_range:      9
+        window_azimuth:    3
+
+      # Interferogram multi-look
       interferogram:
-        range_looks: 11
-        azimuth_looks: 3
-        flatten: true
+        range_looks:       11
+        azimuth_looks:     3
+        flatten:           true       # subtract flat-earth + topographic phase
 
+      # Phase unwrapping
       unwrap:
-        algorithm: ICU
+        run_unwrap:        true
+        algorithm:         icu        # icu | snaphu
+        snaphu:
+          cost_type:       SMOOTH     # SMOOTH | DEFO | TOPO
+          init_method:     mcf
 
+      # Geocoding
       geocode:
-        algorithm: interp
-        epsg: 4326
+        algorithm:         interp     # interp | area_projection
+        epsg:              4326
+        top_left:
+          x_abs:           -1e-5      # set to null for auto-bbox from scene
+          y_abs:            1e-5
+        spacing:
+          x:               8.3e-4    # ~80 m at equator
+          y:               8.3e-4
+
+      # Ionosphere correction (split-spectrum)
+      ionosphere_phase_correction:
+        enabled:           true
+        spectral_diversity: split_main_band
+        phase_filter:
+          filter_type:     gaussian
+          kernel_range_max: 200
+          kernel_range_min: 100
+        coherence_threshold: 0.5
+        apply_correction:  false      # write screen only; user applies separately
 ```
 
 ### Generating a Default Runconfig
 
+Every workflow module provides a flag to dump a fully-annotated default runconfig:
+
 ```bash
-python -m nisar.workflows.insar --generate-runconfig > insar_runconfig.yaml
+# InSAR (RIFG/RUNW/GUNW)
+python -m nisar.workflows.insar --generate-runconfig > insar_default.yaml
+
+# Backscatter (GCOV)
+python -m nisar.workflows.gcov --generate-runconfig > gcov_default.yaml
+
+# Geocoded SLC
+python -m nisar.workflows.gslc --generate-runconfig > gslc_default.yaml
+
+# RSLC focusing
+python -m nisar.workflows.focus --generate-runconfig > rslc_default.yaml
 ```
 
-### Validating a Runconfig
+Edit the generated file: at minimum replace all placeholder file paths and adjust the polarisation list to match your data.
+
+### Validating a Runconfig Before Running
 
 ```bash
 python -m nisar.workflows.insar --validate-runconfig insar_runconfig.yaml
 ```
 
+This checks schema compliance and that all required input files exist before submitting to a compute cluster.
+
 ---
 
 ## 14. GPU Acceleration
 
-GPU paths are available when `isce3-cuda` is installed or the source build includes `-DWITH_CUDA=ON`.
+GPU-accelerated processing is available when `isce3-cuda` is installed (conda) or the source build includes `-DWITH_CUDA=ON`. The GPU APIs are designed as drop-in replacements for their CPU counterparts with identical interfaces.
 
 ### Modules with GPU Acceleration
 
@@ -944,32 +1418,71 @@ GPU paths are available when `isce3-cuda` is installed or the source build inclu
 |---|---|---|
 | Geocoding | `isce3.geocode.GeocodeFloat32` | `isce3.cuda.geocode.GeocodeFloat32` |
 | Crossmul | `isce3.signal.Crossmul` | `isce3.cuda.signal.Crossmul` |
-| Ampcor | `isce3.matchtemplate.AmpcorNormSqCorr` | `isce3.cuda.matchtemplate.PyCuAmpcor` |
+| Ampcor (offset tracking) | `isce3.matchtemplate.AmpcorNormSqCorr` | `isce3.cuda.matchtemplate.PyCuAmpcor` |
 | Backprojection | `isce3.focus.backproject` | `isce3.cuda.focus.backproject` |
 | Resamp | `isce3.image.ResampSlc` | `isce3.cuda.image.ResampSlc` |
 
-GPU APIs are drop-in replacements for CPU equivalents. Workflow scripts automatically select GPU when available.
+NISAR workflow scripts automatically select GPU implementations when a CUDA device is available and `isce3-cuda` is installed — no code changes are required.
+
+### GPU Device Management
 
 ```python
 import isce3
 
-print(isce3.cuda.have_cuda())        # Check availability
-isce3.cuda.print_cuda_device_info()  # List devices
-isce3.cuda.set_device(device_id=0)   # Select device
+# Check whether CUDA is available
+if isce3.cuda.have_cuda():
+    # List available GPU devices
+    isce3.cuda.print_cuda_device_info()
+
+    # Select a specific GPU (for multi-GPU systems)
+    isce3.cuda.set_device(device_id=0)
+
+    # Use the GPU geocoder (same API as CPU version)
+    geocode = isce3.cuda.geocode.GeocodeFloat32()
+    # ... same setup and call as CPU version
 ```
+
+### Performance Expectations
+
+GPU acceleration provides the greatest benefit for compute-intensive operations with large data volumes:
+
+| Operation | CPU (32-core) | GPU (A100) | Speedup |
+|---|---|---|---|
+| Backprojection (full NISAR frame) | ~4 hours | ~5 minutes | ~50× |
+| Geocoding (1000 km × 250 km scene) | ~20 min | ~90 seconds | ~13× |
+| Ampcor (dense offset grid) | ~60 min | ~3 min | ~20× |
 
 ---
 
 ## 15. Parallel Processing (OpenMP)
 
-CPU modules use OpenMP for multi-threaded parallelism:
+All CPU modules use **OpenMP** for multi-threaded parallelism on shared-memory systems. Control the thread count via the standard OpenMP environment variable:
 
 ```bash
+# Use all available cores
+export OMP_NUM_THREADS=$(nproc)
+
+# Pin to a specific count for reproducibility or cluster policy
 export OMP_NUM_THREADS=16
+
+# Run a workflow with the thread count set
 python -m nisar.workflows.gcov --run-config-path gcov_runconfig.yaml
 ```
 
-If not set, OpenMP defaults to the number of physical CPU cores.
+If `OMP_NUM_THREADS` is not set, OpenMP defaults to the number of physical CPU cores on the machine.
+
+Additional OpenMP tuning knobs:
+
+```bash
+# Prefer thread affinity for NUMA systems (bind threads to cores)
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+
+# Avoid thread oversubscription when running multiple workflows simultaneously
+export OMP_NUM_THREADS=8   # half the cores per workflow
+```
+
+For cluster environments (SLURM, PBS), set `OMP_NUM_THREADS` to match the number of CPUs allocated per task, and avoid mixing MPI + OpenMP unless the workflow explicitly supports it.
 
 ---
 
@@ -977,102 +1490,175 @@ If not set, OpenMP defaults to the number of physical CPU cores.
 
 ### HDF5 Product Datasets
 
-| Path | Content |
+Key metadata paths common across NISAR products:
+
+| HDF5 path | Dtype | Shape | Contents |
+|---|---|---|---|
+| `.../metadata/orbit/position` | float64 | (M, 3) | ECEF position [x,y,z] (m) |
+| `.../metadata/orbit/velocity` | float64 | (M, 3) | ECEF velocity [vx,vy,vz] (m/s) |
+| `.../metadata/orbit/time` | float64 | (M,) | UTC seconds from epoch |
+| `.../metadata/orbit/orbitType` | string | scalar | "POE" \| "RES" \| "PRE" |
+| `.../swaths/frequencyA/slantRange` | float64 | (W,) | Slant range vector (m) |
+| `.../swaths/frequencyA/zeroDopplerTime` | float64 | (L,) | Zero-Doppler azimuth time (s) |
+| `.../swaths/frequencyA/centerFrequency` | float64 | scalar | Carrier frequency (Hz) |
+| `.../swaths/frequencyA/processedRangeBandwidth` | float64 | scalar | Processed range bandwidth (Hz) |
+| `.../swaths/frequencyA/HH` | complex64 | (L, W) | Complex SLC data |
+
+GUNW-specific datasets:
+
+| HDF5 path | Contents |
 |---|---|
-| `.../metadata/orbit/position` | ECEF position [x,y,z] in meters |
-| `.../metadata/orbit/velocity` | ECEF velocity [vx,vy,vz] in m/s |
-| `.../metadata/orbit/time` | UTC times (seconds from reference) |
-| `.../swaths/frequencyA/slantRange` | Slant range vector (meters) |
-| `.../swaths/frequencyA/zeroDopplerTime` | Zero-Doppler azimuth time vector (seconds) |
+| `.../science/LSAR/GUNW/grids/frequencyA/unwrappedPhase` | Geocoded unwrapped interferometric phase (rad) |
+| `.../science/LSAR/GUNW/grids/frequencyA/coherence` | Interferometric coherence (0–1) |
+| `.../science/LSAR/GUNW/grids/frequencyA/connectedComponents` | Phase unwrapping connected component labels |
+| `.../science/LSAR/GUNW/ionosphere/ionospherePhaseScreen` | Estimated ionospheric phase (rad) — not applied |
+| `.../science/LSAR/GUNW/ionosphere/ionospherePhaseScreenUncertainty` | 1-sigma uncertainty of ionospheric phase estimate |
 
 ### Raster Formats
 
-| Format | Extension | Use case |
+| Format | Extension | Notes |
 |---|---|---|
-| GeoTIFF | `.tif` | General-purpose geocoded outputs |
-| ENVI | `.bin` / `.hdr` | Legacy / intermediate files |
-| VRT | `.vrt` | Virtual mosaics and views |
-| HDF5 | `.h5` | Standard NISAR products |
+| GeoTIFF | `.tif` | Recommended for geocoded outputs; supports compression |
+| ENVI | `.bin` + `.hdr` | Good for intermediate binary files; no compression |
+| VRT | `.vrt` | GDAL Virtual Raster; references other files |
+| HDF5 | `.h5` | All NISAR standard products |
 
 ### Common EPSG Codes
 
-| EPSG | Description |
-|---|---|
-| 4326 | WGS84 geographic (lat/lon) |
-| 32601–32660 | UTM zones, Northern hemisphere |
-| 32701–32760 | UTM zones, Southern hemisphere |
-| 3031 | Antarctic Polar Stereographic |
-| 3413 | Arctic Polar Stereographic (NSIDC) |
+| EPSG | CRS | Use case |
+|---|---|---|
+| 4326 | WGS84 geographic (lat/lon) | Global DEMs and products |
+| 32601–32660 | UTM North zones 1–60 | Northern hemisphere scenes |
+| 32701–32760 | UTM South zones 1–60 | Southern hemisphere scenes |
+| 3031 | WGS84 Antarctic Polar Stereographic | Antarctic scenes |
+| 3413 | WGS84 Arctic Polar Stereographic (NSIDC) | Arctic scenes |
+| 4087 | WGS84 World Equidistant Cylindrical | Near-equatorial wide-area |
 
 ---
 
 ## 17. Ecosystem and Related Tools
 
-**OPERA** — Uses ISCE3 to generate operational analysis-ready products from Sentinel-1 and NISAR: DIST-ALERT, DISP-S1, CSLC-S1, RTC-S1.
+### OPERA
 
-**PLAnT-ISCE3** ([github.com/isce-framework/plant-isce3](https://github.com/isce-framework/plant-isce3)) — Polarimetric Interferometric Lab and Analysis Tool built on ISCE3.
+The [OPERA (Observational Products for End-Users from Remote Sensing Analysis)](https://www.jpl.nasa.gov/go/opera) project at JPL uses ISCE3 as its processing backbone to generate operational, analysis-ready SAR products from Sentinel-1 and NISAR:
 
-**nisarqa** ([github.com/isce-framework/nisarqa](https://github.com/isce-framework/nisarqa)) — Quality assurance tool for NISAR products:
+| OPERA product | Input | Description |
+|---|---|---|
+| **CSLC-S1** | Sentinel-1 SLC | Coregistered SLC using backprojection, 20 m posting |
+| **RTC-S1** | Sentinel-1 SLC | Radiometrically terrain corrected backscatter, 30 m |
+| **DISP-S1** | CSLC-S1 time series | Surface displacement from InSAR time series |
+| **DIST-ALERT** | RTC time series | Near-real-time surface disturbance detection |
+| **DIST-ANN** | RTC time series | Annual surface disturbance maps |
+
+### PLAnT-ISCE3
+
+[PLAnT-ISCE3](https://github.com/isce-framework/plant-isce3) (Polarimetric Interferometric Lab and Analysis Tool) provides Python scripts for PolSAR analysis (Cloude-Pottier decomposition, Pauli decomposition, PolInSAR) built on top of ISCE3.
+
+### nisarqa — Quality Assurance
+
+[nisarqa](https://github.com/isce-framework/nisarqa) validates NISAR product files and generates QA summary reports. It is the official QA tool run on every NISAR L1/L2 product:
 
 ```bash
+# Dump annotated default runconfig for RSLC QA
 nisarqa dumpconfig rslc > rslc_qa.yaml
+
+# Run QA on an RSLC product
 nisarqa rslc --run-config-path rslc_qa.yaml
+
+# Available subcommands match product types:
+# nisarqa rslc | gslc | gcov | rifg | runw | gunw | roff | goff
 ```
 
-**MultiRTC** ([github.com/MultiSAR/MultiRTC](https://github.com/MultiSAR/MultiRTC)) — ISCE3-based RTC for multiple SAR missions.
+### MultiRTC
 
-**sds-ondemand** ([github.com/isce-framework/sds-ondemand](https://github.com/isce-framework/sds-ondemand)) — Jupyter notebook tutorials for cloud-based NISAR processing.
+[MultiRTC](https://github.com/MultiSAR/MultiRTC) is a community library for generating ISCE3-based RTC products from multiple SAR missions, including Sentinel-1, ALOS-2, SAOCOM, and NISAR. It handles the mission-specific metadata differences and normalises inputs to ISCE3's common data model.
+
+### SDS On-Demand Tutorials
+
+[sds-ondemand](https://github.com/isce-framework/sds-ondemand) provides Jupyter notebook tutorials for NISAR science processing on cloud computing platforms (AWS, Google Cloud). These notebooks demonstrate end-to-end workflows from data access through product generation and visualisation.
+
+### MintPy — Time-Series Analysis
+
+[MintPy](https://github.com/insarlab/MintPy) (Miami InSAR Time-series software in PYthon) is the recommended tool for InSAR time-series analysis of ISCE3-produced interferograms. It reads ISCE3/NISAR GUNW products directly and performs network inversion, atmospheric correction, and velocity estimation.
 
 ---
 
 ## 18. Troubleshooting
 
-**`ImportError: No module named 'isce3'`** — Confirm the correct conda environment is active (`conda activate isce3`) and the package is installed (`conda list isce3`).
+**`ImportError: No module named 'isce3'`**
+Confirm the correct conda environment is active: `conda activate isce3`. Verify the package is installed: `conda list | grep isce3`. If building from source, check that `PYTHONPATH` includes the install prefix's `packages/` directory.
 
-**HDF5 version conflicts** — Pin HDF5: `conda install -c conda-forge hdf5=1.12`
+**HDF5 library version mismatch (warnings or crash on file open)**
+Pin HDF5 to a compatible version: `conda install -c conda-forge hdf5=1.12`. This is a common issue when mixing conda packages built against different HDF5 versions.
 
-**Conda solver timeout** — Use mamba: `conda install -c conda-forge mamba && mamba install -c conda-forge isce3`
+**Conda solver timeout or "solving environment" hanging**
+Switch to mamba: `conda install -c conda-forge mamba && mamba install -c conda-forge isce3`. Mamba uses a faster C++ solver.
 
-**GPU out-of-memory** — Reduce tile/block size in the runconfig, or use a GPU with more VRAM.
+**geo2rdr returns NaN or fails to converge**
+Check that `LookSide` is set correctly — swapping Left/Right causes the algorithm to search in the wrong hemisphere of solutions. Increase `maxiter` to 100 for very high squint angles (> 20°) or polar scenes where convergence is slower. Verify the orbit covers the requested time with margin.
 
-**Phase unwrapping diverges** — Increase `coherence_threshold` to mask low-quality pixels; try switching SNAPHU to `DEFO` mode; use tiled processing for large images.
+**Output image is all zeros after backprojection**
+Verify the orbit time span covers the full acquisition duration plus at least 30 seconds of margin on each side. Confirm `fc`, `dt`, and `dr` match the actual acquisition parameters — errors here prevent any pixel from converging.
 
-**DEM not covering the scene** — Ensure the DEM bounding box extends at least 0.1 degrees beyond the SAR scene footprint on all sides.
+**DEM does not cover the radar scene**
+ISCE3 raises a `RuntimeError` if the DEM bounding box does not fully contain the scene footprint. Expand the DEM by at least 0.5° in all directions, or use a global DEM (Copernicus GLO-30 covers all land between 90°S and 90°N).
+
+**Phase unwrapping produces disconnected islands or wrong cycles**
+Increase `coherence_threshold` to mask more low-quality pixels before unwrapping. For SNAPHU, switch to `DEFO` mode if the scene contains large deformation gradients. Enable tiled SNAPHU (`tile_nrow`, `tile_ncol`) for scenes larger than ~5,000 × 5,000 pixels.
+
+**Ionosphere correction makes the interferogram worse**
+The split-spectrum noise amplification factor is $f_0 / \Delta f$ — for NISAR L-band with 75 MHz separation this is ~17×. If sub-band coherence is below ~0.4 across most of the scene, the TEC estimate is too noisy to apply. Raise `coherence_threshold` to 0.6–0.7 or disable ionosphere correction entirely for very low-coherence scenes (dense forest, 12-day repeat).
+
+**GPU out-of-memory error**
+Reduce `blocksize` in the backprojection call or `tile_size` in the geocoder to process smaller chunks at a time. On multi-GPU systems, distribute processing across devices with `isce3.cuda.set_device()`.
+
+**GCOV shows stripes aligned in range**
+This is typically caused by a Doppler centroid estimation error propagating into the azimuth compression. Verify the Doppler LUT is correctly populated and covers the full scene; use `isce3.core.LUT2d()` (all zeros) only for truly zero-Doppler data.
+
+**Coregistration offsets look wrong (large uniform offset)**
+A constant offset of many pixels usually indicates a timing or orbit epoch mismatch between reference and secondary. Check that both orbit objects use the same epoch convention and that the sensing-start time in the radar grid is correct.
 
 ---
 
 ## 19. Glossary
 
 | Term | Definition |
-|---|---|
-| **Azimuth** | Along-track direction (parallel to satellite flight path) |
-| **Range / Slant range** | Cross-track distance from antenna to target |
-| **SLC** | Single Look Complex — focused SAR image with preserved phase |
-| **InSAR** | Interferometric SAR — phase difference measurement between two acquisitions |
-| **Interferogram** | Complex image of phase differences between two SLCs |
-| **Coherence** | Phase quality measure (0–1); low coherence means poor interferometric phase |
-| **Phase unwrapping** | Converting wrapped (−π,π) phase to continuous absolute phase |
-| **Geocoding** | Projecting a radar-grid image to a map coordinate grid |
-| **RTC** | Radiometric Terrain Correction — backscatter normalization for local slope |
-| **DEM** | Digital Elevation Model — raster of terrain heights |
-| **ECEF** | Earth-Centered Earth-Fixed Cartesian coordinate system |
-| **Zero-Doppler** | Azimuth convention: pixel timed at moment of closest satellite approach |
-| **PRF** | Pulse Repetition Frequency — radar pulse rate (azimuth sampling) |
-| **LUT** | Lookup Table — gridded array for fast interpolation of slowly-varying quantities |
-| **NISAR** | NASA-ISRO SAR mission (L- and S-band, dual polarization) |
-| **RSLC** | Range-Doppler Single Look Complex (NISAR Level-1) |
-| **GSLC** | Geocoded SLC (NISAR Level-1) |
-| **GCOV** | Geocoded Covariance matrix (NISAR Level-2 backscatter) |
-| **RIFG** | Range-Doppler wrapped Interferogram (NISAR Level-2) |
-| **RUNW** | Range-Doppler Unwrapped interferogram (NISAR Level-2) |
-| **GUNW** | Geocoded Unwrapped interferogram (NISAR Level-2) |
-| **ROFF / GOFF** | Range-Doppler / Geocoded pixel offsets (NISAR Level-2) |
-| **TEC** | Total Electron Content — ionospheric electron density integral |
-| **SNAPHU** | Statistical-cost, Network-flow Algorithm for Phase Unwrapping |
-| **ICU** | Integrated Correlation and Unwrapping (branch-cut unwrapper) |
-| **OpenMP** | Open Multi-Processing — shared-memory parallel programming API |
-| **CUDA** | NVIDIA GPU parallel computing platform |
-| **pybind11** | C++11 library for creating Python bindings of C++ code |
+|--------|-----------|
+| **Azimuth** | Along-track direction, parallel to the satellite flight path |
+| **Range / Slant range** | Cross-track distance measured along the radar line of sight from antenna to target |
+| **SLC** | Single Look Complex — a focused SAR image retaining complex (amplitude + phase) values |
+| **InSAR** | Interferometric SAR — technique using the phase difference between two SAR acquisitions to measure range change |
+| **Interferogram** | Complex image of the phase difference between two co-registered SLCs |
+| **Coherence** | Measure of phase stability (0–1); coherence near zero means the phase is unreliable |
+| **Phase unwrapping** | Converting wrapped phase (−π to π) to a continuous, ambiguity-resolved phase map |
+| **Geocoding** | Projecting a radar-coordinate image onto a geographic map grid |
+| **Coregistration** | Aligning the secondary SLC to the same pixel grid as the reference SLC |
+| **RTC** | Radiometric Terrain Correction — normalising backscatter amplitude for local terrain slope |
+| **DEM** | Digital Elevation Model — a raster of terrain surface heights |
+| **ECEF** | Earth-Centered Earth-Fixed Cartesian coordinate system (X, Y, Z in metres) |
+| **Zero-Doppler** | Azimuth timing convention where each pixel is assigned to the moment of closest radar-target approach |
+| **PRF** | Pulse Repetition Frequency — the rate at which radar pulses are transmitted (Hz); determines azimuth sampling |
+| **LUT** | Lookup Table — a gridded array for fast interpolation of slowly varying quantities |
+| **TEC / STEC / VTEC** | Total Electron Content; Slant (line-of-sight integrated); Vertical (zenith-integrated). Unit: TECU = 10¹⁶ e⁻/m² |
+| **NISAR** | NASA-ISRO Synthetic Aperture Radar mission, operating at L-band (1.26 GHz) and S-band (3.19 GHz) |
+| **RSLC** | Range-Doppler Single Look Complex — NISAR Level-1 focused SLC in radar coordinates |
+| **GSLC** | Geocoded SLC — NISAR Level-1 SLC resampled to a map grid, phase preserved |
+| **GCOV** | Geocoded Covariance matrix — NISAR Level-2 polarimetric backscatter with RTC |
+| **RIFG** | Range-Doppler Interferogram (wrapped) — NISAR Level-2 |
+| **RUNW** | Range-Doppler Unwrapped interferogram — NISAR Level-2 |
+| **GUNW** | Geocoded Unwrapped interferogram — NISAR Level-2 |
+| **ROFF / GOFF** | Range-Doppler / Geocoded pixel offset products — NISAR Level-2 |
+| **SNAPHU** | Statistical-cost, Network-flow Algorithm for Phase Unwrapping — the primary robust unwrapper in ISCE3 |
+| **ICU** | Integrated Correlation and Unwrapping — fast branch-cut unwrapper in ISCE3 |
+| **Ampcor** | Amplitude cross-correlation — algorithm for measuring sub-pixel image offsets |
+| **MoCo** | Motion Compensation — correction for non-ideal platform trajectory in frequency-domain focusers |
+| **OpenMP** | Open Multi-Processing — API for shared-memory parallel programming in C++ |
+| **CUDA** | NVIDIA Compute Unified Device Architecture — the GPU parallel computing platform used by ISCE3 |
+| **pybind11** | C++11-based library for creating Python bindings of C++ code, used throughout ISCE3 |
+| **IONEX** | IONosphere Map EXchange format — standard ASCII format for Global Ionosphere Maps |
+| **GIM** | Global Ionosphere Map — gridded VTEC map produced by IGS analysis centres |
+| **Perpendicular baseline** | Component of the separation between two radar acquisitions perpendicular to the look direction; controls topographic sensitivity |
+| **OPERA** | Observational Products for End-Users from Remote Sensing Analysis — JPL project producing analysis-ready products from ISCE3 |
 
 ---
 

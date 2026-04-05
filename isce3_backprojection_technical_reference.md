@@ -170,7 +170,7 @@ This is the **fundamental backprojection equation**. Each term has a clear physi
 
 In practice, slow time is sampled at the PRF: $\eta_n = \eta_1 + n/\text{PRF}$, $n = 0, 1, \ldots, N_a - 1$. The discrete backprojection sum is:
 
-$$I(\mathbf{r}_t) = \sum_{n=0}^{N_a - 1} w_n \cdot \mathcal{I}\!\left\{s_{rc}(\cdot,\, n),\, \frac{2R(\eta_n;\mathbf{r}_t)}{c}\right\} \exp\!\left(+j\frac{4\pi R(\eta_n;\mathbf{r}_t)}{\lambda}\right)$$
+$$I(\mathbf{r}_t) = \sum_{n=0}^{N_a - 1} w_n \cdot \mathcal{I}\!\left\lbrace s_{rc}(\cdot,\, n),\, \frac{2R(\eta_n;\mathbf{r}_t)}{c}\right\rbrace \exp\!\left(+j\frac{4\pi R(\eta_n;\mathbf{r}_t)}{\lambda}\right)$$
 
 where:
 
