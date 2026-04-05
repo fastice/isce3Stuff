@@ -959,22 +959,29 @@ A time-domain SAR focusing algorithm. Geometrically exact and particularly well 
 
 ```python
 import isce3
+import isce3.ext.isce3 as isce
+import numpy as np
 
-isce3.focus.backproject(
-    output     = output_raster,     # pre-allocated complex64 output SLC
-    input      = rc_raster,         # range-compressed input data
-    orbit      = orbit,
-    doppler    = doppler,           # Doppler centroid LUT2d (use LUT2d() for zero)
-    dem        = dem_raster,
-    ellipsoid  = isce3.core.Ellipsoid(),
-    fc         = 1.2575e9,          # carrier frequency (Hz)
-    dt         = 1.0 / 1520.0,     # azimuth sample spacing (s) = 1/PRF
-    dr         = 1.0 / 180e6,      # range sample spacing (s) = 1/fs
-    side       = isce3.core.LookSide.Left,
-    threshold  = 1e-8,
-    maxiter    = 50,
-    flatten    = True,              # remove flat-earth phase
-    kernel     = isce3.core.Sinc2dInterpolator(sincLen=9, sincSub=1024)
+# orbit, radar_grid, and doppler are loaded from the product HDF5
+in_geometry  = isce.container.RadarGeometry(in_radar_grid, orbit, doppler)
+out_geometry = isce.container.RadarGeometry(out_radar_grid, orbit, doppler)
+dem          = isce.geometry.DEMInterpolator(terrain_height_m)   # or from raster
+
+# Knab kernel (9 taps), tabulated for speed
+kernel = isce.core.TabulatedKernelF32(
+    isce.core.KnabKernel(9., range_bandwidth / range_sample_rate), 2048)
+
+out = np.empty((out_lines, out_samples), np.complex64)
+
+err = isce.focus.backproject(
+    out, out_geometry,
+    signal_data, in_geometry,    # range-compressed input (np.ndarray complex64)
+    dem,
+    center_frequency,            # Hz
+    azimuth_resolution,          # desired azimuth resolution (m)
+    kernel,
+    dry_tropo_model="tsx",       # or "nodelay"
+    height=height_out            # optional float32 output buffer
 )
 ```
 
@@ -985,20 +992,22 @@ Separates the full-bandwidth radar signal into low and high frequency sub-bands 
 > 📄 **Deep-dive available:** See the [ISCE3 Ionosphere Correction Module — Technical Reference](isce3_ionosphere_technical_reference.md) for a full treatment of plasma physics, the split-spectrum derivation, TEC estimation equations, NISAR QQP polarimetric bias, external GIM/IONEX correction, Faraday rotation, and extended API usage.
 
 ```python
-import isce3
+from isce3.splitspectrum import SplitSpectrum
 
-split = isce3.signal.SplitSpectrum()
-
-split.split_spectrum(
-    slc_raster        = slc_raster,         # full-band SLC
-    low_sub_raster    = low_band_raster,    # output: low sub-band SLC
-    high_sub_raster   = high_band_raster,   # output: high sub-band SLC
-    range_bandwidth   = 80.0e6,             # full range bandwidth (Hz)
-    center_frequency  = 1.2575e9,           # carrier (Hz)
-    low_sub_bw        = 20.0e6,             # low sub-band bandwidth (Hz)
-    high_sub_bw       = 20.0e6,             # high sub-band bandwidth (Hz)
-    window_function   = "cosine"
+# Constructed with the SLC's sampling metadata
+ss = SplitSpectrum(
+    rg_sample_freq   = rg_sample_freq,   # Hz — from SLC metadata
+    rg_bandwidth     = 80.0e6,           # Hz — full range bandwidth
+    center_frequency = 1.2575e9,         # Hz — carrier
+    slant_range      = slant_range,      # 1-D array (m)
+    freq             = 'A',
 )
+
+# Extract low and high sub-bands (returns np.ndarray + metadata dict each)
+low_slc,  meta_low  = ss.bandpass_shift_spectrum(
+    slc_arr, fc - bw/2, fc, f_L, window_function="cosine")
+high_slc, meta_high = ss.bandpass_shift_spectrum(
+    slc_arr, fc, fc + bw/2, f_H, window_function="cosine")
 ```
 
 The sub-band SLCs are then processed through the standard InSAR chain independently, and the differential phase between the two sub-band interferograms is used to estimate the Total Electron Content (TEC) and derive an ionospheric phase correction screen.

@@ -579,36 +579,34 @@ Similarly, if the perpendicular baseline $B_\perp$ is non-zero, the two acquisit
 
 ### 12.1 Function Signatures
 
-**CPU version:**
+**CPU version (`isce3.focus.backproject`):**
 
 ```python
 isce3.focus.backproject(
-    output,           # isce3.io.Raster  — output focused SLC
-    input,            # isce3.io.Raster  — range-compressed raw data
-    orbit,            # isce3.core.Orbit
-    doppler,          # isce3.core.LUT2d — Doppler centroid (Hz)
-    dem,              # isce3.io.Raster  — DEM (ellipsoid-referenced)
-    ellipsoid,        # isce3.core.Ellipsoid
-    fc,               # float — carrier frequency (Hz)
-    dt,               # float — slow-time (azimuth) sample spacing (s) = 1/PRF
-    dr,               # float — fast-time (range) sample spacing (s) = 1/fs
-    side,             # isce3.core.LookSide — Right or Left
-    threshold=1e-8,   # float — Newton iteration convergence threshold (m)
-    maxiter=50,       # int   — maximum Newton iterations for geo2rdr
-    blocksize=1024,   # int   — range-line processing block size
-    flatten=True,     # bool  — remove flat-earth phase before output
-    az_looks=1,       # int   — azimuth multi-look factor
-    rg_looks=1,       # int   — range multi-look factor
-    kernel=None       # isce3.core.Kernel — interpolation kernel
+    out,                        # np.ndarray complex64 — output focused pixels, shape (lines, samples)
+    out_geometry,               # isce3.container.RadarGeometry — output grid + orbit + Doppler
+    in_data,                    # np.ndarray complex64 — range-compressed input, shape (lines, samples)
+    in_geometry,                # isce3.container.RadarGeometry — input grid + orbit + Doppler
+    dem,                        # isce3.geometry.DEMInterpolator — terrain height model
+    fc,                         # float — carrier frequency (Hz)
+    ds,                         # float — desired azimuth resolution (m)
+    kernel,                     # isce3.core.Kernel — 1-D range interpolation kernel
+    dry_tropo_model="tsx",      # str — dry troposphere model: "tsx" or "nodelay"
+    *,
+    height=None                 # np.ndarray float32 — optional output: DEM height at each pixel
 )
+# Returns: isce3.error.ErrorCode (non-zero if any pixel geometry fails to converge)
 ```
 
-**GPU version:**
+**GPU version (`isce3.cuda.focus.backproject`)** — identical except for an extra `batch` parameter:
 
 ```python
 isce3.cuda.focus.backproject(
-    # Same signature as CPU version
-    # Automatically selects GPU device set by isce3.cuda.set_device()
+    out, out_geometry, in_data, in_geometry, dem, fc, ds, kernel,
+    dry_tropo_model="tsx",
+    *,
+    batch=1024,    # int — number of input range lines processed per GPU batch
+    height=None
 )
 ```
 
@@ -616,117 +614,110 @@ isce3.cuda.focus.backproject(
 
 | Parameter | Type | Description |
 |---|---|---|
-| `output` | `isce3.io.Raster` | Output SLC raster. Must be pre-allocated with correct dimensions and complex dtype. |
-| `input` | `isce3.io.Raster` | Range-compressed input data (complex64). Dimensions: `[N_range, N_azimuth]`. |
-| `orbit` | `isce3.core.Orbit` | Platform orbit covering the full data acquisition interval with margin. |
-| `doppler` | `isce3.core.LUT2d` | Doppler centroid in Hz as a function of (azimuth time, slant range). Pass `isce3.core.LUT2d()` for zero Doppler (most satellite cases). |
-| `dem` | `isce3.io.Raster` | Digital Elevation Model. Must be WGS84 ellipsoid-referenced and cover the output swath. EPSG:4326 recommended. |
-| `ellipsoid` | `isce3.core.Ellipsoid` | Reference ellipsoid. Use `isce3.core.Ellipsoid()` for WGS84 default. |
-| `fc` | `float` | Carrier frequency in Hz (e.g., `1.257e9` for NISAR L-band). |
-| `dt` | `float` | Azimuth sample spacing in seconds = $1/\text{PRF}$. |
-| `dr` | `float` | Range sample spacing in seconds = $1/f_s$ where $f_s$ is the range sampling rate. |
-| `side` | `isce3.core.LookSide` | `LookSide.Right` (most spaceborne SARs) or `LookSide.Left`. |
-| `threshold` | `float` | Convergence threshold in metres for the Newton's method geo2rdr solver used to determine which aperture positions illuminate each pixel. Default `1e-8` m. |
-| `maxiter` | `int` | Maximum Newton iterations. Default 50. Increase for high-squint or polar geometries. |
-| `blocksize` | `int` | Number of range lines processed per block. Larger blocks improve cache utilisation but require more RAM. |
-| `flatten` | `bool` | If `True`, removes the flat-earth (zero-baseline) phase component from the output, centring the phase on zero. Usually `True` for InSAR. |
-| `az_looks` | `int` | Multi-look factor in azimuth. `1` for full-resolution SLC. |
-| `rg_looks` | `int` | Multi-look factor in range. `1` for full-resolution SLC. |
-| `kernel` | `isce3.core.Kernel` | Interpolation kernel. If `None`, defaults to the `Sinc2dInterpolator` with kernel length 9. |
+| `out` | `np.ndarray[complex64]` | Pre-allocated output buffer of shape `(lines, samples)`. Filled in-place. |
+| `out_geometry` | `isce3.container.RadarGeometry` | Encapsulates the output radar grid (`RadarGridParameters`), orbit, and Doppler LUT for the target image grid. |
+| `in_data` | `np.ndarray[complex64]` | Range-compressed (pulse-compressed) input data of shape `(lines, samples)`. |
+| `in_geometry` | `isce3.container.RadarGeometry` | Encapsulates the input data's radar grid, orbit, and Doppler LUT. |
+| `dem` | `isce3.geometry.DEMInterpolator` | Terrain height model. Construct with `DEMInterpolator(height_m)` for a constant height, or load from a raster. |
+| `fc` | `float` | Carrier frequency in Hz (e.g., `1.2575e9` for NISAR L-band). |
+| `ds` | `float` | Desired output azimuth resolution in metres. Controls the length of the synthetic aperture used per pixel. |
+| `kernel` | `isce3.core.Kernel` | 1-D interpolation kernel applied in the range direction. Typical choice: `isce3.core.TabulatedKernelF32(isce3.core.KnabKernel(9, B/fs), 2048)`. |
+| `dry_tropo_model` | `str` | Dry troposphere path delay model. `"tsx"` applies the TerraSAR-X model (Breit et al. 2010); `"nodelay"` disables atmospheric correction. Default: `"tsx"`. |
+| `batch` | `int` (GPU only) | Number of input range lines loaded per GPU batch. Larger values use more GPU memory but may be faster. Default: `1024`. |
+| `height` | `np.ndarray[float32]` | Optional pre-allocated output buffer of same shape as `out`. If provided, filled with the ellipsoidal height (m) of each focused pixel as determined by the DEM. |
 
 ### 12.3 Worked Example
 
-The following end-to-end example focuses a range-compressed UAVSAR L-band acquisition:
+The following end-to-end example follows the pattern used in ISCE3's own test suite (`tests/python/extensions/pybind/focus/backproject.py`). It focuses a point-target simulation stored in HDF5:
 
 ```python
 import isce3
+import isce3.ext.isce3 as isce
 import h5py
 import numpy as np
+from isce3.core import load_orbit_from_h5_group
 
-# ── 1. Load range-compressed data and orbit from an HDF5 product ──────────────
-with h5py.File("uavsar_rangecmp.h5", "r") as f:
-    rc_data = f["/data/rangecmp"][:]          # complex64, shape (N_rg, N_az)
-    pos_arr = f["/orbit/position"][:]         # (M, 3) ECEF meters
-    vel_arr = f["/orbit/velocity"][:]         # (M, 3) ECEF m/s
-    t_arr   = f["/orbit/time"][:]             # (M,) seconds from epoch
-    epoch   = str(f["/orbit/epoch"][()])      # ISO string
+c = isce.core.speed_of_light
 
-# ── 2. Build Orbit object ─────────────────────────────────────────────────────
-epoch_dt = isce3.core.DateTime(epoch)
-state_vecs = []
-for i in range(len(t_arr)):
-    t  = epoch_dt + isce3.core.TimeDelta(seconds=float(t_arr[i]))
-    sv = isce3.core.StateVector(t, pos_arr[i], vel_arr[i])
-    state_vecs.append(sv)
-orbit = isce3.core.Orbit(state_vecs)
+# ── 1. Load range-compressed data from HDF5 ──────────────────────────────────
+with h5py.File("point-target-sim-rc.h5", "r") as f:
+    signal_data      = f["data"][()]                          # complex64 array
+    orbit            = load_orbit_from_h5_group(f["orbit"])
+    doppler          = isce.core.LUT2d.load_from_h5(f["doppler"], "doppler")
+    sensing_start    = f["time_of_first_pulse"][()]
+    az_spacing       = f["pulse_spacing"][()]
+    two_way_delay    = f["two_way_range_delay"][()]
+    rg_sample_rate   = f["range_sample_rate"][()]
+    center_freq      = f["center_frequency"][()]
+    look_side        = f["look_side"][()]
+    terrain_height   = f["terrain_height"][()]
+    apply_atm        = f["atmosphere_model"][()]
 
-# ── 3. Set radar geometry parameters ─────────────────────────────────────────
-fc        = 1.2575e9              # L-band carrier frequency (Hz)
-prf       = 1000.0                # Pulse Repetition Frequency (Hz)
-fs        = 180.0e6               # Range sampling rate (Hz)
-dt        = 1.0 / prf             # Azimuth sample spacing (s)
-dr        = 1.0 / fs              # Range sample spacing (s)
-side      = isce3.core.LookSide.Left   # UAVSAR is left-looking
-ellipsoid = isce3.core.Ellipsoid()
-doppler   = isce3.core.LUT2d()    # Zero Doppler (default)
+lines, samples = signal_data.shape
+near_range  = c / 2. * two_way_delay
+rg_spacing  = c / (2. * rg_sample_rate)
+wavelength  = c / center_freq
+prf         = 1. / az_spacing
 
-# ── 4. Create output raster ───────────────────────────────────────────────────
-N_rg, N_az = rc_data.shape
-out_raster = isce3.io.Raster(
-    "focused_slc.slc",
-    width=N_rg,
-    length=N_az,
-    num_bands=1,
-    dtype=isce3.io.gdal_dtype.CFloat32,
-    driver_name="ENVI"
+# ── 2. Build input RadarGeometry (grid + orbit + Doppler) ────────────────────
+in_grid = isce.product.RadarGridParameters(
+    sensing_start, wavelength, prf, near_range, rg_spacing,
+    look_side, lines, samples, orbit.reference_epoch)
+in_geometry = isce.container.RadarGeometry(in_grid, orbit, doppler)
+
+# ── 3. Build output RadarGeometry (a small chip centred on the target) ────────
+target_azimuth = ...   # seconds from epoch (loaded from HDF5)
+target_range   = ...   # metres
+nchip = 129
+dt = in_grid.az_time_interval
+dr = in_grid.range_pixel_spacing
+t0 = target_azimuth - 0.5 * (nchip - 1) * dt
+r0 = target_range   - 0.5 * (nchip - 1) * dr
+out_grid = isce.product.RadarGridParameters(
+    t0, wavelength, prf, r0, dr, look_side, nchip, nchip, orbit.reference_epoch)
+out_geometry = isce.container.RadarGeometry(out_grid, orbit, doppler)
+
+# ── 4. DEM and interpolation kernel ──────────────────────────────────────────
+dem = isce.geometry.DEMInterpolator(terrain_height)   # constant-height DEM
+
+B = 20e6          # range bandwidth (Hz)
+azimuth_res = 6.  # desired azimuth resolution (m)
+
+# Knab kernel, 9 samples wide; tabulate for performance
+kernel = isce.core.KnabKernel(9., B / rg_sample_rate)
+kernel = isce.core.TabulatedKernelF32(kernel, 2048)
+
+# ── 5. Allocate output buffers ────────────────────────────────────────────────
+out    = np.empty((nchip, nchip), np.complex64)
+height = np.empty((nchip, nchip), np.float32)
+
+dry_tropo_model = "tsx" if apply_atm else "nodelay"
+
+# ── 6. Run backprojection (CPU) ───────────────────────────────────────────────
+err = isce.focus.backproject(
+    out, out_geometry,
+    signal_data, in_geometry,
+    dem, center_freq, azimuth_res, kernel,
+    dry_tropo_model,
+    height=height
 )
+assert not err, f"Backprojection geometry failed to converge: {err}"
 
-# ── 5. Write range-compressed data to a temporary raster ─────────────────────
-in_raster = isce3.io.Raster(
-    "rangecmp.slc",
-    width=N_rg,
-    length=N_az,
-    num_bands=1,
-    dtype=isce3.io.gdal_dtype.CFloat32,
-    driver_name="ENVI"
-)
-in_raster.set_array(band=1, data=rc_data.astype(np.complex64))
+print(f"Focusing complete. Output shape: {out.shape}")
+print(f"Pixel heights (m above ellipsoid): {height.mean():.1f}")
 
-# ── 6. Load DEM ───────────────────────────────────────────────────────────────
-dem_raster = isce3.io.Raster("/path/to/dem_wgs84.tif")
-
-# ── 7. Choose interpolation kernel ───────────────────────────────────────────
-# Sinc kernel, 9 taps — best for InSAR phase preservation
-kernel = isce3.core.Sinc2dInterpolator(sincLen=9, sincSub=1024)
-
-# ── 8. Run backprojection (CPU) ───────────────────────────────────────────────
-isce3.focus.backproject(
-    output    = out_raster,
-    input     = in_raster,
-    orbit     = orbit,
-    doppler   = doppler,
-    dem       = dem_raster,
-    ellipsoid = ellipsoid,
-    fc        = fc,
-    dt        = dt,
-    dr        = dr,
-    side      = side,
-    threshold = 1e-8,
-    maxiter   = 50,
-    flatten   = True,
-    kernel    = kernel
-)
-
-print("Focusing complete. Output: focused_slc.slc")
-
-# ── 9. (Optional) GPU version — identical API ─────────────────────────────────
-if isce3.cuda.have_cuda():
-    isce3.cuda.set_device(0)
-    isce3.cuda.focus.backproject(
-        output=out_raster, input=in_raster, orbit=orbit,
-        doppler=doppler, dem=dem_raster, ellipsoid=ellipsoid,
-        fc=fc, dt=dt, dr=dr, side=side, flatten=True, kernel=kernel
+# ── 7. (Optional) GPU version — same positional args, adds batch ──────────────
+if hasattr(isce, "cuda"):
+    out_gpu = np.empty_like(out)
+    err = isce.cuda.focus.backproject(
+        out_gpu, out_geometry,
+        signal_data, in_geometry,
+        dem, center_freq, azimuth_res, kernel,
+        dry_tropo_model,
+        batch=1024,
+        height=height
     )
+    assert not err
 ```
 
 ---
